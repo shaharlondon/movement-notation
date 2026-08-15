@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Movement Notation: Figure 1 (feathers)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #fff; overflow: hidden; }
+  #canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<script src="skeleton.js"></script>
+
+<script>
+// Figure 1: feathers.
+//
+// The vertical axis. Each limb leaves a fan of tapered petals behind it, one
+// sampled every 150ms, fading out over 4.5 seconds.
+//
+// This file is loaded by index.html inside a frame. It has no camera and no
+// detection engine of its own: the host page runs both, once, and pushes the
+// body landmarks in through window.onResults.
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// The canvas fills the frame it is given.
+function fitToFrame() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+fitToFrame();
+window.addEventListener('resize', fitToFrame);
+
+// --- landmark layout ---------------------------------------------------
+const LM = {
+  leftEye: 2, rightEye: 5,
+  Lsh: 11, Rsh: 12, Lel: 13, Rel: 14, Lwr: 15, Rwr: 16,
+  Lhip: 23, Rhip: 24, Lkn: 25, Rkn: 26, Lank: 27, Rank: 28
+};
+
+// extra landmarks used only to give the wrist/ankle a small pointing
+// direction for the trail (not drawn as part of the live skeleton)
+const EXTRA_LM = {
+  Lidx: 19, Ridx: 20, Lpinky: 17, Rpinky: 18, Lft: 31, Rft: 32
+};
+
+// one entry per limb: a chain of joint keys from the fixed body root
+// (shoulder/hip) out to a small trailing extremity feather (hand/foot).
+// every sample records the whole chain's angles together so consecutive
+// feathers always stay connected end to end
+const LIMBS = [
+  { name: 'Larm', chain: ['Lsh', 'Lel', 'Lwr', 'LhandTip'] },
+  { name: 'Rarm', chain: ['Rsh', 'Rel', 'Rwr', 'RhandTip'] },
+  { name: 'Lleg', chain: ['Lhip', 'Lkn', 'Lank', 'Lft'] },
+  { name: 'Rleg', chain: ['Rhip', 'Rkn', 'Rank', 'Rft'] }
+];
+
+// --- trail buffers -------------------------------------------------------
+const DECAY_MS = 1150;      // exp(-t/DECAY_MS) ~ 0.02 at ~4.5s
+const MAX_AGE_MS = 4500;
+const SAMPLE_INTERVAL_MS = 150; // discrete petals, not one per raw frame
+const TRAIL_COLOR = '0, 0, 0'; // black, decays to gray as it fades over the white page
+
+const trails = {};
+const lastSample = {};
+for (const limb of LIMBS) { trails[limb.name] = []; lastSample[limb.name] = 0; }
+
+// draw a tapered flame/petal shape from `root` pointing at `angle`,
+// widening then tapering to a point (a lens silhouette), like the
+// feather shapes fanning off the shoulder in the reference illustration
+function petalPath(root, angle, length, maxWidth) {
+  const ux = Math.cos(angle), uy = Math.sin(angle);
+  const nx = -uy, ny = ux;
+  const steps = 12;
+  ctx.beginPath();
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const w = Math.sin(t * Math.PI) * maxWidth;
+    const x = root.x + ux * t * length + nx * w;
+    const y = root.y + uy * t * length + ny * w;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  for (let i = steps; i >= 0; i--) {
+    const t = i / steps;
+    const w = Math.sin(t * Math.PI) * maxWidth;
+    const x = root.x + ux * t * length - nx * w;
+    const y = root.y + uy * t * length - ny * w;
+    ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+function drawPetal(root, angle, length, alpha) {
+  const maxWidth = Math.max(3, length * (0.06 + 0.09 * alpha));
+  petalPath(root, angle, length, maxWidth);
+  ctx.fillStyle = `rgba(${TRAIL_COLOR}, ${alpha})`;
+  ctx.fill();
+}
+
+function mirroredPoint(landmark, w, h) {
+  if (!landmark || landmark.visibility !== undefined && landmark.visibility < 0.3) return null;
+  return { x: w - landmark.x * w, y: landmark.y * h };
+}
+
+function mid(a, b) {
+  return (a && b) ? { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } : null;
+}
+
+// The body itself comes from the shared skeleton (skeleton.js), so that it is
+// identical in every figure: same structure, head, shoulder line, spine,
+// pelvis line, limbs, and same weight and colour.
+function drawSkeleton(P) {
+  MovementNotation.drawSkeleton(ctx, P);
+}
+
+function updateAndDrawTrails(P, now) {
+  const shMid = mid(P.Lsh, P.Rsh);
+  const hipMid = mid(P.Lhip, P.Rhip);
+  const V = (shMid && hipMid) ? { x: hipMid.x - shMid.x, y: hipMid.y - shMid.y } : null;
+  const Vlen = V ? Math.hypot(V.x, V.y) : 0;
+  const VAngle = V ? Math.atan2(V.y, V.x) : null;
+
+  for (const limb of LIMBS) {
+    const pts = limb.chain.map((k) => P[k]);
+    const buf = trails[limb.name];
+
+    // record one sample covering as much of the chain as is currently
+    // visible (root outward; a missing hand/foot point just shortens this
+    // sample's chain, it doesn't block the upper-limb feathers), every
+    // SAMPLE_INTERVAL_MS so a sample's segments always share one age and
+    // therefore always stay connected end to end at render time
+    if (pts[0] && V && Vlen > 1e-3 && now - lastSample[limb.name] >= SAMPLE_INTERVAL_MS) {
+      const segs = [];
+      for (let i = 0; i < pts.length - 1; i++) {
+        if (!pts[i] || !pts[i + 1]) break;
+        const dx = pts[i + 1].x - pts[i].x, dy = pts[i + 1].y - pts[i].y;
+        const len = Math.hypot(dx, dy);
+        if (len < 1e-3) break;
+        const theta = Math.atan2(V.x * dy - V.y * dx, V.x * dx + V.y * dy);
+        segs.push({ theta, length: len });
+      }
+      if (segs.length) {
+        buf.push({ segs, t: now });
+        lastSample[limb.name] = now;
+      }
+    }
+
+    // drop expired points
+    while (buf.length && now - buf[0].t > MAX_AGE_MS) buf.shift();
+
+    if (!pts[0] || VAngle === null) continue;
+
+    // faint guide arcs at the current reach of each segment, echoing the
+    // boundary circle in the reference illustration
+    if (buf.length) {
+      ctx.strokeStyle = 'rgba(30, 30, 30, 0.08)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < pts.length - 1; i++) {
+        if (!pts[i] || !pts[i + 1]) continue;
+        ctx.beginPath();
+        ctx.arc(pts[i].x, pts[i].y, Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y), 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    for (const pt of buf) {
+      const age = now - pt.t;
+      const alpha = Math.exp(-age / DECAY_MS);
+      if (alpha < 0.02) continue;
+
+      // each feather's root is the previous feather's reconstructed tip
+      // (not the live joint), so the whole chain always meets up exactly
+      let origin = pts[0];
+      for (const seg of pt.segs) {
+        const angle = VAngle + seg.theta;
+        drawPetal(origin, angle, seg.length, alpha);
+        origin = {
+          x: origin.x + Math.cos(angle) * seg.length,
+          y: origin.y + Math.sin(angle) * seg.length
+        };
+      }
+    }
+  }
+}
+
+// Draws a single frame from a list of body landmarks.
+function drawFrame(landmarks, now) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!landmarks) return;
+
+  const w = canvas.width, h = canvas.height;
+  const P = {};
+  for (const key in LM) P[key] = mirroredPoint(landmarks[LM[key]], w, h);
+  for (const key in EXTRA_LM) P[key] = mirroredPoint(landmarks[EXTRA_LM[key]], w, h);
+  // small derived point for the hand's pointing direction (foot already
+  // has a single reliable landmark, the foot index / toe)
+  P.LhandTip = mid(P.Lpinky, P.Lidx);
+  P.RhandTip = mid(P.Rpinky, P.Ridx);
+
+  // Layer 2 (trails) first, underneath the live skeleton
+  updateAndDrawTrails(P, now);
+  // Layer 1 (live skeleton) on top
+  drawSkeleton(P);
+}
+
+// This figure draws a trail that fades over time, so the drawing has to refresh
+// at screen rate rather than at the slower rate landmarks arrive from detection.
+// Otherwise both the decay and the trail come out broken up.
+let lastLandmarks = null;
+let lastPush = 0;
+
+// Drawing happens on both paths: the moment new landmarks arrive, and on every
+// screen frame. That way the decay is smooth while the loop runs, and if the
+// browser throttles the frame loop (in a background tab, say) the figure still
+// draws at detection rate. Drawing twice in one frame does no harm: each draw
+// clears and redraws from scratch.
+window.onResults = (results) => {
+  lastLandmarks = results && results.poseLandmarks;
+  lastPush = performance.now();
+  drawFrame(lastLandmarks, lastPush);
+};
+
+(function renderLoop() {
+  requestAnimationFrame(renderLoop);
+  // While the figure is inactive it receives no landmarks, so there is nothing
+  // to keep drawing
+  if (!lastLandmarks || performance.now() - lastPush > 1000) return;
+  drawFrame(lastLandmarks, performance.now());
+})();
+
+window.resetFigure = () => {
+  // Empty the buffers but keep the keys, the code assumes one per limb
+  for (const limb of LIMBS) { trails[limb.name].length = 0; lastSample[limb.name] = 0; }
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Movement Notation: Figure 2 (circles)</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #fff; overflow: hidden; }
+    #container { position: relative; width: 100vw; height: 100vh; }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+<div id="container">
+  <canvas id="trail-canvas"></canvas>
+  <canvas id="live-canvas"></canvas>
+</div>
+
+<script src="skeleton.js"></script>
+
+<script>
+// Figure 2: circles.
+//
+// Angle crossings. Two layers: trail-canvas keeps what has accumulated, and
+// live-canvas is cleared and redrawn every frame. Whenever a joint angle
+// crosses 90 or 180 degrees, a coloured circle is stamped onto the trail layer
+// and stays there.
+//
+// This file is loaded by index.html inside a frame. It has no camera and no
+// detection engine of its own: the host page runs both, once, and pushes the
+// body landmarks in through window.onResults.
+
+const trailCanvas = document.getElementById('trail-canvas');
+const liveCanvas = document.getElementById('live-canvas');
+const trailCtx = trailCanvas.getContext('2d');
+const liveCtx = liveCanvas.getContext('2d');
+
+const TOL_IN = 8;
+const TOL_OUT = 14;
+const DISC_FLATTEN = 0.32;  // how flat the perpendicular disc looks (0 = line, 1 = full circle)
+
+function resize() {
+  for (const c of [trailCanvas, liveCanvas]) {
+    c.width = window.innerWidth;
+    c.height = window.innerHeight;
+  }
+}
+resize();
+window.addEventListener('resize', resize);
+
+// MediaPipe landmark indices
+const L_SHOULDER = 11, R_SHOULDER = 12;
+const L_ELBOW = 13, R_ELBOW = 14;
+const L_WRIST = 15, R_WRIST = 16;
+const L_HIP = 23, R_HIP = 24;
+const L_KNEE = 25, R_KNEE = 26;
+const L_ANKLE = 27, R_ANKLE = 28;
+const L_EYE = 2, R_EYE = 5;
+
+const NEEDED = [L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW, L_WRIST, R_WRIST, L_HIP, R_HIP, L_KNEE, R_KNEE, L_ANKLE, R_ANKLE, L_EYE, R_EYE];
+
+// Maps the numeric indices this file works with onto the point names the
+// shared skeleton (skeleton.js) expects to receive
+const SKELETON_KEYS = {
+  leftEye: L_EYE, rightEye: R_EYE,
+  Lsh: L_SHOULDER, Rsh: R_SHOULDER,
+  Lel: L_ELBOW, Rel: R_ELBOW,
+  Lwr: L_WRIST, Rwr: R_WRIST,
+  Lhip: L_HIP, Rhip: R_HIP,
+  Lkn: L_KNEE, Rkn: R_KNEE,
+  Lank: L_ANKLE, Rank: R_ANKLE
+};
+
+// root -> mid -> end, one entry per limb
+const LIMBS = [
+  [L_SHOULDER, L_ELBOW, L_WRIST],
+  [R_SHOULDER, R_ELBOW, R_WRIST],
+  [L_HIP, L_KNEE, L_ANKLE],
+  [R_HIP, R_KNEE, R_ANKLE]
+];
+
+// Angle points: angle sits at `v` between bones v->a and v->b.
+const ANGLES = [
+  { v: L_ELBOW, a: L_SHOULDER, b: L_WRIST },
+  { v: R_ELBOW, a: R_SHOULDER, b: R_WRIST },
+  { v: L_KNEE, a: L_HIP, b: L_ANKLE },
+  { v: R_KNEE, a: R_HIP, b: R_ANKLE },
+  { v: L_SHOULDER, a: R_SHOULDER, b: L_ELBOW },
+  { v: R_SHOULDER, a: L_SHOULDER, b: R_ELBOW },
+  { v: L_HIP, a: R_HIP, b: L_KNEE },
+  { v: R_HIP, a: L_HIP, b: R_KNEE }
+];
+const wasRight = new Array(ANGLES.length).fill(false);     // 90 degrees
+const wasStraight = new Array(ANGLES.length).fill(false);  // 180 degrees
+
+let prevLimbs = [null, null, null, null];
+
+function getLandmark(lm, index) {
+  const p = lm[index];
+  if (!p || p.visibility < 0.3) return null;
+  // Mirror horizontally (selfie mode)
+  return { x: (1 - p.x) * liveCanvas.width, y: p.y * liveCanvas.height };
+}
+
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function strokeCircle(ctx, cx, cy, r) {
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+function strokeEllipse(ctx, cx, cy, rx, ry, rot) {
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx, ry, rot, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+// Live "potential space" suggestion for one segment: a faint full circle
+// (center = proximal joint, radius = distance to distal joint) plus a
+// dashed ellipse perpendicular to the segment, for a 3D-disc feel.
+// Redrawn every frame on liveCanvas; nothing here persists by itself.
+function drawSphere(ctx, center, target) {
+  const r = dist(center, target);
+  if (r < 1) return;
+  const theta = Math.atan2(target.y - center.y, target.x - center.x);
+  // The live circle -- the one that moves with the hand -- is heavier and darker
+  // than the stamps left behind, so it leads rather than being swallowed by the
+  // background of traces.
+  ctx.strokeStyle = 'rgba(0,0,0,0.42)';
+  ctx.lineWidth = 2.2;
+  ctx.setLineDash([]);
+  strokeCircle(ctx, center.x, center.y, r);
+  ctx.strokeStyle = 'rgba(0,0,0,0.30)';
+  ctx.lineWidth = 1.6;
+  ctx.setLineDash([6, 5]);
+  strokeEllipse(ctx, center.x, center.y, r * DISC_FLATTEN, r, theta);
+  ctx.setLineDash([]);
+}
+
+function angleAt(root, mid, end) {
+  const v1x = root.x - mid.x, v1y = root.y - mid.y;
+  const v2x = end.x - mid.x, v2y = end.y - mid.y;
+  const m1 = Math.hypot(v1x, v1y), m2 = Math.hypot(v2x, v2y);
+  if (m1 < 1 || m2 < 1) return null;
+  const cos = (v1x * v2x + v1y * v2y) / (m1 * m2);
+  return Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
+}
+
+// A fresh random color for each crossing event
+function randomColor() {
+  const h = Math.floor(Math.random() * 360);
+  return `hsl(${h}, 85%, 45%)`;
+}
+
+function fillDot(ctx, p, radius) {
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function pathLine(a, b) {
+  if (!a || !b) return;
+  trailCtx.beginPath();
+  trailCtx.moveTo(a.x, a.y);
+  trailCtx.lineTo(b.x, b.y);
+  trailCtx.stroke();
+}
+
+// Accumulate the joint-path trace onto the persistent canvas: mid and end
+// points only (elbow/wrist, knee/ankle): the extremities and their
+// immediate joints, not the fixed shoulder/hip roots.
+function drawTrailStep(prev, cur) {
+  trailCtx.setLineDash([]);
+  trailCtx.strokeStyle = 'rgba(0,0,0,0.35)';
+  trailCtx.lineWidth = 1.2;
+  if (prev) {
+    pathLine(prev.mid, cur.mid);
+    pathLine(prev.end, cur.end);
+  }
+}
+
+// 90 degrees -> plain solid circle, same center/radius as the live segment
+// sphere, frozen permanently onto the trail canvas (no dashed ellipse).
+// Thin delicate stroke, closer in weight to the faint field than to the
+// black skeleton: color is what carries the event, not line thickness.
+function stampRight(center, target, col) {
+  const r = dist(center, target);
+  if (r < 1) return;
+  trailCtx.setLineDash([]);
+  trailCtx.strokeStyle = col;
+  trailCtx.lineWidth = 0.6;
+  strokeCircle(trailCtx, center.x, center.y, r);
+}
+
+// 180 degrees -> same thin circle stamp, marginally heavier stroke + a
+// small center dot so it reads as distinct from the 90 degree stamp.
+function stampStraight(center, target, col) {
+  const r = dist(center, target);
+  if (r < 1) return;
+  trailCtx.setLineDash([]);
+  trailCtx.strokeStyle = col;
+  trailCtx.lineWidth = 1;
+  strokeCircle(trailCtx, center.x, center.y, r);
+  trailCtx.fillStyle = col;
+  fillDot(trailCtx, center, 2.5);
+}
+
+window.onResults = function (results) {
+  liveCtx.clearRect(0, 0, liveCanvas.width, liveCanvas.height);
+
+  if (!results.poseLandmarks) return;
+  const lm = results.poseLandmarks;
+
+  const P = {};
+  for (const i of NEEDED) P[i] = getLandmark(lm, i);
+
+  // What accumulates on the canvas: the joint-path lines (black) and the
+  // coloured 90 and 180 degree stamps.
+
+  // persistent joint-path trace, one limb at a time
+  const curLimbs = LIMBS.map(([r, m, e]) => ({ root: P[r], mid: P[m], end: P[e] }));
+  for (let i = 0; i < LIMBS.length; i++) {
+    drawTrailStep(prevLimbs[i], curLimbs[i]);
+  }
+  prevLimbs = curLimbs;
+
+  // live faint "potential space" spheres, one per segment (root->mid,
+  // mid->end), drawn fresh every frame and cleared with the rest of liveCanvas
+  for (const [r, m, e] of LIMBS) {
+    if (P[r] && P[m]) drawSphere(liveCtx, P[r], P[m]);
+    if (P[m] && P[e]) drawSphere(liveCtx, P[m], P[e]);
+  }
+
+  // The body itself comes from the shared skeleton, so that it is identical in
+  // every figure: head, shoulder line, spine, pelvis line and limbs.
+  const skel = {};
+  for (const name in SKELETON_KEYS) skel[name] = P[SKELETON_KEYS[name]];
+  MovementNotation.drawSkeleton(liveCtx, skel);
+
+  // angle-crossing events -> permanent colored circle stamps on the trail canvas
+  for (let i = 0; i < ANGLES.length; i++) {
+    const { v, a, b } = ANGLES[i];
+    const pv = P[v], pa = P[a], pb = P[b];
+    if (pv && pa && pb) {
+      const deg = angleAt(pa, pv, pb);
+      if (deg !== null) {
+        if (!wasRight[i] && Math.abs(deg - 90) <= TOL_IN) {
+          stampRight(pv, pb, randomColor());
+          wasRight[i] = true;
+        } else if (Math.abs(deg - 90) > TOL_OUT) {
+          wasRight[i] = false;
+        }
+        if (!wasStraight[i] && Math.abs(deg - 180) <= TOL_IN) {
+          stampStraight(pv, pb, randomColor());
+          wasStraight[i] = true;
+        } else if (Math.abs(deg - 180) > TOL_OUT) {
+          wasStraight[i] = false;
+        }
+      }
+    } else {
+      wasRight[i] = false;
+      wasStraight[i] = false;
+    }
+  }
+};
+
+// Clears the accumulated stamps. The cycle page calls this every time this
+// figure comes up, so each 20 seconds starts from a clean drawing. It also
+// resets the angle-crossing memory, otherwise the current angle could
+// immediately register as a fresh crossing.
+window.resetFigure = function () {
+  trailCtx.clearRect(0, 0, trailCanvas.width, trailCanvas.height);
+  wasRight.fill(false);
+  wasStraight.fill(false);
+};
+
+</script>
+</body>
+</html>

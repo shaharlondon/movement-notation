@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Movement Notation: Figure 5 (plates)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #fff; overflow: hidden; }
+  #container { position: relative; width: 100vw; height: 100vh; }
+  canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="container">
+  <canvas id="canvas"></canvas>
+</div>
+
+<script src="skeleton.js"></script>
+
+<script>
+// Figure 5: plates.
+//
+// This file is loaded by index.html inside a frame. It has no camera and no
+// detection engine of its own: the host page runs both, once, and pushes the
+// body landmarks in through window.onResults.
+//
+// The horizontal plane of movement.
+//
+// Every joint gets a plate: a flattened ellipse, always parallel to the floor.
+// The plate represents the horizontal plane in which that joint moves.
+//
+// The measurement ignores the Y axis (up-down) entirely and looks only at X and
+// Z (width and depth): how much angle has accumulated around the body's vertical
+// axis. Up-down movement is not counted at all.
+//
+// The feedback: a gradient that rotates on the plate according to the joint's
+// current angular position in the horizontal plane -- like a hoop spinning
+// around the waist. The more rotation accumulates, the stronger the gradient
+// grows and the more the plate comes alive.
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// Real perspective: the pelvis plate is the horizon line, and every other plate
+// has its own angle, derived from its vertical distance from that line.
+//
+// This is how it works in reality: a circle at eye height reads as a thin line,
+// and the further it moves from eye height -- up or down -- the more it opens.
+// Above the horizon you look at it from below and see its underside; below the
+// horizon you look down on it and see its face. That is what gives the plates a
+// place in space instead of an arbitrary angle.
+const FLATTEN_AT_HORIZON = 0.03;  // almost a line -- a plate sitting on the horizon
+const FLATTEN_MAX = 0.30;         // the maximum opening -- gentle, it does not
+                                   // roll the plate toward the camera
+const PERSPECTIVE_SPAN = 0.46;    // distance from the horizon (as a fraction of
+                                   // screen height) at which full opening is
+                                   // reached. Larger = the opening spreads out
+                                   // slowly and stays restrained
+const BONE_WIDTH = MovementNotation.STYLE.boneWidth;   // from the shared skeleton
+
+const THICKNESS_FRAC = 0.045;  // plate thickness relative to its radius -- thin
+const MIN_THICKNESS = 1.5;     // minimum thickness in pixels
+
+// The plates are fully opaque and fixed in size -- they neither grow nor shrink
+// with movement. What movement does is rotate them.
+const SECTORS = 180;           // segments used to draw the reflection (dense = a smooth band)
+const GRAIN_FREQ = 18;         // density of the radial fibres in the texture
+
+// The reflection: a band of light that crosses the plate and spins with it. This
+// is what conveys the rotation -- not a mark and not a label, just the way light
+// catches the surface, like the sheen running across a glossy surface as it turns.
+const SPEC_SHARP = 3.0;        // how narrow and sharp the band of light is (higher = sharper)
+const SPEC_LOW = 150;          // the tone where the light is not caught
+const SPEC_HIGH = 255;         // the tone at the core of the band
+const SPIN_GAIN = 1.6;         // slight gain, so the band clearly rotates
+
+// Black and white only, with a grain print in place of colour: fine monochrome
+// noise, loaded as a repeating texture and laid over the face, like a riso print
+// on paper.
+const GRAIN_TILE = 96;         // size of the noise tile in pixels
+const GRAIN_ALPHA = 0.14;      // how strongly the grain shows
+const GRAIN_CONTRAST = 34;     // range of the noise around mid grey
+
+// The speed mechanism, as in the cones: velocity over a short window, mapped
+// through a curve with no hard ceiling, so accelerating always gains something.
+const SPEED_WINDOW_MS = 260;   // short window: the speed now, not in the past
+const SPEED_SCALE = 1.5;       // torso-lengths per second at which about 63% of the intensity is reached
+const SPEED_RISE = 0.35;       // immediate response to acceleration
+const SPEED_FALL = 0.06;       // slow decay -- leaves a memory and encourages carrying on
+
+// Emphasising the depth axis: forward-backward movement (z) contributes several
+// times more to the measured speed than sideways movement (x). This is the
+// inverse of the feathers -- there it is the vertical axis, here it is depth.
+const DEPTH_WEIGHT = 1.0;      // weight of the depth component
+const LATERAL_WEIGHT = 0.35;   // weight of the lateral component
+
+const PHASE_SMOOTH = 0.35;     // smoothing of the gradient's rotation
+
+
+function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+// The noise tile is built once at load time and used as a repeating texture. It
+// matters that it is built once and not every frame: noise re-randomised each
+// frame "boils" on screen and pulls the eye, instead of looking like a print on
+// paper.
+const grainPattern = (() => {
+  const tile = document.createElement('canvas');
+  tile.width = tile.height = GRAIN_TILE;
+  const tctx = tile.getContext('2d');
+  const img = tctx.createImageData(GRAIN_TILE, GRAIN_TILE);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = 128 + (Math.random() - 0.5) * 2 * GRAIN_CONTRAST;
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+    img.data[i + 3] = 255;
+  }
+  tctx.putImageData(img, 0, 0);
+  return ctx.createPattern(tile, 'repeat');
+})();
+
+const ID = {
+  nose: 0, leftEye: 2, rightEye: 5,
+  Lsh: 11, Rsh: 12, Lel: 13, Rel: 14, Lwr: 15, Rwr: 16,
+  Lhip: 23, Rhip: 24, Lkn: 25, Rkn: 26, Lank: 27, Rank: 28
+};
+
+const LINE_CHAINS = [
+  ['leftEye', 'rightEye'],
+  ['leftEye', 'Neck'],
+  ['Lsh', 'Rsh'],
+  ['Neck', 'Pelvis'],
+  ['Lhip', 'Rhip'],
+  ['Lsh', 'Lel', 'Lwr'],
+  ['Rsh', 'Rel', 'Rwr'],
+  ['Lhip', 'Lkn', 'Lank'],
+  ['Rhip', 'Rkn', 'Rank']
+];
+
+// Each plate: where it is drawn, its fixed radius, and how far it is offset
+// vertically. Large near the body, smaller toward the extremities. The radius is
+// fixed rather than derived from the segment length, so the plates do not change
+// size while moving. Tying it to the canvas height (rather than hard pixels) only
+// fits them to the screen.
+//
+// dy: a vertical offset as a fraction of the canvas height, used where plates
+// would otherwise sit at almost the same point and stack on top of each other.
+// The neck plate stays at neck height -- raising it swallows the head, lowering
+// it lands it on the chest -- so it is the shoulder plates that move instead.
+const PLATES = [
+  { key: 'Pelvis', pos: 'Pelvis', r: 0.195, horizon: true },
+  { key: 'Neck',   pos: 'Neck',   r: 0.150 },
+  { key: 'Lel',  pos: 'Lel',  r: 0.077 },
+  { key: 'Rel',  pos: 'Rel',  r: 0.077 },
+  { key: 'Lwr',  pos: 'Lwr',  r: 0.062 },
+  { key: 'Rwr',  pos: 'Rwr',  r: 0.062 },
+  { key: 'Lkn',  pos: 'Lkn',  r: 0.077 },
+  { key: 'Rkn',  pos: 'Rkn',  r: 0.077 },
+  { key: 'Lank', pos: 'Lank', r: 0.062 },
+  { key: 'Rank', pos: 'Rank', r: 0.062 }
+];
+
+function getLandmark(lm, index) {
+  const p = lm[index];
+  if (!p || p.visibility < 0.3) return null;
+  // z arrives at roughly the same scale as x -- multiplied by the width to compare in pixels
+  return { x: (1 - p.x) * canvas.width, y: p.y * canvas.height, z: p.z * canvas.width };
+}
+function mid(a, b) {
+  return (a && b) ? { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 } : null;
+}
+function normAngle(d) { while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; }
+
+// --- measuring rotation in the horizontal plane (X and Z only, no Y) ---
+const intensity = {};
+const phaseState = {};
+
+function horizontalAngle(p, center) {
+  // The joint's angle around the body's vertical axis -- width and depth only
+  return Math.atan2(p.z - center.z, p.x - center.x);
+}
+
+// Weighted planar speed. Angular velocity does not work here: a hand crossing
+// close to the body's midline produces an enormous jump in angle (the r-squared
+// denominator goes to zero), which wipes out the depth advantage. Instead this
+// measures the joint's net displacement in the horizontal plane across the window
+// -- depth at full weight, lateral reduced -- normalized by the torso length, so
+// the measure does not depend on distance from the camera. Summing vectors
+// (rather than path lengths) also cancels MediaPipe's z noise at rest: random
+// flickers offset each other.
+const prevRel = {};
+const velHist = {};
+let bodyScale = 1;             // torso length in pixels; updated every frame
+
+function updateSpeed(key, p, center, now) {
+  const x = p.x - center.x, z = p.z - center.z;
+  const prev = prevRel[key];
+  prevRel[key] = { x, z };
+
+  let h = velHist[key];
+  if (!h) h = velHist[key] = [];
+  if (prev) h.push({ dx: x - prev.x, dz: z - prev.z, t: now });
+  while (h.length && now - h[0].t > SPEED_WINDOW_MS) h.shift();
+
+  let speed = 0;
+  if (h.length > 1) {
+    const span = (now - h[0].t) / 1000;
+    if (span > 0.02) {
+      // The first sample is only an anchor -- its interval ends before the window
+      let sx = 0, sz = 0;
+      for (let i = 1; i < h.length; i++) { sx += h[i].dx; sz += h[i].dz; }
+      speed = Math.hypot(DEPTH_WEIGHT * sz, LATERAL_WEIGHT * sx) / span / Math.max(1, bodyScale);
+    }
+  }
+
+  const target = 1 - Math.exp(-speed / SPEED_SCALE);
+  if (intensity[key] === undefined) intensity[key] = 0;
+  const rate = target > intensity[key] ? SPEED_RISE : SPEED_FALL;
+  intensity[key] += (target - intensity[key]) * rate;
+  return intensity[key];
+}
+
+// --- drawing ----------------------------------------------------------
+// The plate is drawn as a body with thickness: a top face, a lit side wall, and
+// a contact shadow beneath it. Together these three create the 3D illusion --
+// the light comes from the upper left, so the wall is bright on the left and
+// dark on the right, exactly like a lit cylinder.
+// flat  -- how flat this plate's ellipse is, according to its distance from the
+//          horizon line
+// above -- whether it is above the horizon. If so, it is seen from below, and
+//          the whole vertical construction inverts: the wall moves to the top
+//          side and the shadow to the other. Without that inversion the
+//          perspective illusion breaks.
+function drawPlate(cx, cy, rx, phase, inten, flat, above) {
+  const ry = rx * flat;
+  const h = Math.max(MIN_THICKNESS, rx * THICKNESS_FRAC);
+  const s = above ? -1 : 1;   // which way is "down" as far as this plate is concerned
+
+  // --- soft contact shadow, on the side the plate faces ---------------
+  ctx.save();
+  ctx.translate(cx, cy + s * (h + ry * 0.5));
+  ctx.scale(1, flat);
+  const sg = ctx.createRadialGradient(0, 0, rx * 0.2, 0, 0, rx * 1.2);
+  sg.addColorStop(0, `rgba(0,0,0,${0.13 + 0.10 * inten})`);
+  sg.addColorStop(0.6, `rgba(0,0,0,${0.05 + 0.05 * inten})`);
+  sg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = sg;
+  ctx.beginPath(); ctx.arc(0, 0, rx * 1.2, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // --- the side wall: the crescent between the top face and the bottom, fully opaque ---
+  const wg = ctx.createLinearGradient(cx - rx, cy, cx + rx, cy);
+  wg.addColorStop(0.00, 'rgb(58,58,58)');
+  wg.addColorStop(0.20, 'rgb(96,96,96)');
+  wg.addColorStop(0.62, 'rgb(40,40,40)');
+  wg.addColorStop(1.00, 'rgb(16,16,16)');
+  ctx.fillStyle = wg;
+  ctx.beginPath();
+  if (above) {
+    // Seen from below: the wall shows along the upper edge
+    ctx.ellipse(cx, cy, rx, ry, 0, Math.PI, 0);
+    ctx.ellipse(cx, cy - h, rx, ry, 0, 0, Math.PI, true);
+  } else {
+    // Seen from above: the wall shows along the lower edge
+    ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI);
+    ctx.ellipse(cx, cy + h, rx, ry, 0, Math.PI, 0, true);
+  }
+  ctx.closePath();
+  ctx.fill();
+
+  // --- the top face: opaque material with a rotating texture -----------
+  // A fully opaque base -- nothing behind the plate shows through it
+  ctx.fillStyle = 'rgb(224,224,224)';
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.fill();
+
+  // The reflection: a bright band of light crossing the plate from edge to edge.
+  // Each segment's tone follows from its angular distance to the light direction,
+  // so as the joint moves in the horizontal plane the band spins around the
+  // centre. |cos| puts a peak in both opposite directions, and that is what makes
+  // it a crossing band rather than a slice of pie.
+  const spin = phase * SPIN_GAIN;
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.clip();
+  ctx.translate(cx, cy);
+  ctx.scale(1, flat);
+  for (let i = 0; i < SECTORS; i++) {
+    const a0 = (i / SECTORS) * Math.PI * 2;
+    const a1 = ((i + 1) / SECTORS) * Math.PI * 2;
+    const am = (a0 + a1) / 2;
+    const spec = Math.pow(Math.abs(Math.cos(am - spin)), SPEC_SHARP);
+    const grain = Math.sin(am * GRAIN_FREQ);        // fine fibres in the material
+    // Speed shows on the surface itself: black and white only, so it deepens
+    // the shadow and raises the contrast, with no colour. At rest, no change at all.
+    const lowEff = SPEC_LOW - 55 * inten;
+    const t = lowEff + (SPEC_HIGH - lowEff) * spec + 3 * grain;
+    ctx.fillStyle = `rgb(${t},${t},${t})`;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.arc(0, 0, rx, a0, a1 + 0.004);              // slight overlap to avoid seams
+    ctx.closePath();
+    ctx.fill();
+  }
+  // Faint rings -- the feel of worked material; they stay put while the sheen rotates
+  ctx.strokeStyle = 'rgba(120,114,104,0.18)';
+  ctx.lineWidth = 1;
+  for (let k = 1; k <= 4; k++) {
+    ctx.beginPath(); ctx.arc(0, 0, rx * (k / 5), 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+
+  // Overall top-to-bottom shading -- adds volume to the face
+  const vg = ctx.createLinearGradient(0, cy - ry, 0, cy + ry);
+  vg.addColorStop(0, 'rgba(255,255,255,0.34)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.20)');
+  ctx.fillStyle = vg;
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.fill();
+
+  // A fixed glint in the upper left, kept faint so it does not compete with the
+  // rotating reflection band
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.clip();
+  const hg = ctx.createRadialGradient(cx - rx * 0.42, cy - ry * 0.5, 0,
+                                      cx - rx * 0.42, cy - ry * 0.5, rx * 0.75);
+  hg.addColorStop(0, 'rgba(255,255,255,0.16)');
+  hg.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = hg;
+  ctx.fillRect(cx - rx, cy - ry, rx * 2, ry * 2);
+  ctx.restore();
+
+  // --- the grain print --------------------------------------------------
+  // Laid down last on the face, above the shading and the reflection, so it reads
+  // as a print on the surface rather than a layer beneath it. The noise itself is
+  // built once at load time, so it is stable on screen and does not "boil"
+  // between frames.
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.clip();
+  ctx.globalAlpha = GRAIN_ALPHA;
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = grainPattern;
+  ctx.fillRect(cx - rx, cy - ry - 1, rx * 2, ry * 2 + 2);
+  ctx.restore();
+
+  // --- the outlines: the upper edge in full, the lower only where visible ---
+  ctx.lineWidth = 1.1;
+  ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+  if (above) { ctx.beginPath(); ctx.ellipse(cx, cy - h, rx, ry, 0, Math.PI, 0); ctx.stroke(); }
+  else       { ctx.beginPath(); ctx.ellipse(cx, cy + h, rx, ry, 0, 0, Math.PI); ctx.stroke(); }
+  ctx.strokeStyle = 'rgba(0,0,0,0.80)';
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+
+}
+
+// The body comes from the shared skeleton, exactly as in the other figures --
+// same structure, same weight and colour, and a black dot on every joint.
+function drawLines(P) {
+  MovementNotation.drawSkeleton(ctx, P);
+}
+
+window.onResults = function (results) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (!results.poseLandmarks) return;
+  const lm = results.poseLandmarks;
+
+  const P = {};
+  for (const k in ID) P[k] = getLandmark(lm, ID[k]);
+  P.Neck = mid(P.Lsh, P.Rsh);
+  P.Pelvis = mid(P.Lhip, P.Rhip);
+
+  const now = performance.now();
+
+  // The centre of the body -- the reference point the horizontal angle is measured around
+  const bodyCenter = mid(P.Neck, P.Pelvis);
+  if (!bodyCenter) return;
+
+  const torso = { x: P.Neck.x - P.Pelvis.x, y: P.Neck.y - P.Pelvis.y, z: P.Neck.z - P.Pelvis.z };
+  const tLen = Math.hypot(torso.x, torso.y, torso.z);
+  if (tLen > 1) bodyScale = tLen;   // the scale that normalizes the speed measurement
+
+  // The horizon line: the height at which the pelvis plate sits. Every other plate is measured from it.
+  const horizonY = P.Pelvis.y;
+
+  // The lines sit beneath the plates: the plates are opaque, so they hide
+  // whatever passes behind them -- and that is part of what sells the 3D
+  drawLines(P);
+
+  // Sorted by depth: far plates are drawn first, near ones over them
+  const drawable = [];
+  for (const pl of PLATES) {
+    const p = P[pl.pos];
+    if (!p) continue;
+    const rx = pl.r * canvas.height;  // fixed size -- unaffected by movement or pose
+    const py = p.y + (pl.dy || 0) * canvas.height;   // separating the storeys
+
+    const ang = horizontalAngle(p, bodyCenter);
+    const inten = updateSpeed(pl.key, p, bodyCenter, now);
+
+    if (phaseState[pl.key] === undefined) phaseState[pl.key] = ang;
+    phaseState[pl.key] += normAngle(ang - phaseState[pl.key]) * PHASE_SMOOTH;
+
+
+    // Perspective: how far the plate is from the horizon line, and on which
+    // side. A plate sitting on the horizon is almost flat; the further from it,
+    // the more it opens. Above the horizon it is seen from below, so its vertical
+    // construction inverts.
+    const dist = Math.abs(py - horizonY) / canvas.height;
+    const openness = Math.min(1, dist / PERSPECTIVE_SPAN);
+    const flat = pl.horizon
+      ? FLATTEN_AT_HORIZON
+      : FLATTEN_AT_HORIZON + (FLATTEN_MAX - FLATTEN_AT_HORIZON) * openness;
+    const above = !pl.horizon && py < horizonY;
+
+    drawable.push({ x: p.x, y: py, rx, phase: phaseState[pl.key], inten, z: p.z, flat, above });
+  }
+  // Far ones first. When two plates share a depth, the lower one on screen is
+  // drawn last and therefore sits in front -- and that is what makes the storeys
+  // read as a clear stack
+  drawable.sort((m, n) => (n.z - m.z) || (m.y - n.y));
+  for (const d of drawable) drawPlate(d.x, d.y, d.rx, d.phase, d.inten, d.flat, d.above);
+};
+
+// Nothing accumulates on this canvas: it is cleared and redrawn every frame.
+// What carries over is the motion state, the rotation phase of each plate, its
+// smoothed speed, and the rolling window each one is measured over. Clearing it
+// here means the plates start still and unlit each time the figure comes up.
+window.resetFigure = function () {
+  for (const store of [intensity, phaseState, prevRel, velHist]) {
+    for (const k of Object.keys(store)) delete store[k];
+  }
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+};
+</script>
+</body>
+</html>

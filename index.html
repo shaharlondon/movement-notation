@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- This page is never cached. Without it, a fix in the file does not reach
+     the browser until a hard refresh. The figures are cache-busted separately,
+     with a timestamp on their URL. -->
+<meta http-equiv="cache-control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="pragma" content="no-cache">
+<title>Movement Notation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #fff; overflow: hidden; }
+
+  /* Every figure lives in its own frame, and all of them are preloaded at
+     full size. Hiding is done with opacity, not display:none -- a frame
+     hidden with display:none gets zero dimensions, and the canvas inside it
+     is destroyed and loses its drawing. */
+  .figure {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    border: 0;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .figure.active { opacity: 1; }
+
+  #intro {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: #fff;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    z-index: 10;
+  }
+  #intro.gone { display: none; }
+
+  #play {
+    width: 96px; height: 96px;
+    border-radius: 50%;
+    border: 1.5px solid #000;
+    background: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background .15s, transform .15s;
+  }
+  #play:hover { background: #000; transform: scale(1.04); }
+  #play:hover svg polygon { fill: #fff; }
+  #play svg polygon { fill: #000; }
+
+  #intro-msg {
+    font-family: monospace;
+    font-size: 13px;
+    color: #666;
+    min-height: 18px;
+    text-align: center;
+    padding: 0 24px;
+  }
+
+  /* Runtime controls. They sit above the frames (which are
+     pointer-events:none), and stay hidden while the intro screen is up. */
+  #controls {
+    position: absolute;
+    bottom: 24px; left: 24px;
+    z-index: 15;
+    display: none;
+    gap: 10px;
+  }
+  #controls.show { display: flex; }
+  #controls button {
+    width: 52px; height: 52px;
+    padding: 0;
+    border: 1.5px solid #000;
+    border-radius: 50%;
+    background: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background .15s;
+  }
+  #controls button svg { fill: #000; color: #000; }
+  #controls button:hover { background: #000; }
+  #controls button:hover svg { fill: #fff; color: #fff; }
+  /* While recording the circle fills in, so it is obvious a capture is running */
+  #recBtn.on { background: #000; }
+  #recBtn.on svg { fill: #fff; color: #fff; }
+  #recBtn.on #recDot { fill: #fff; }
+  /* Same logic for pause: the button stays filled while the cycle is stopped */
+  #pauseBtn.on { background: #000; }
+  #pauseBtn.on svg { fill: #fff; }
+
+  /* Only appears when something is broken. Without it, every failure looks
+     the same: an empty white screen. */
+  #diag {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    z-index: 20;
+    background: #111;
+    color: #fff;
+    font-family: monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    padding: 14px 18px;
+    display: none;
+  }
+  #diag.show { display: block; }
+  #diag code { display: inline-block; color: #9ecbff; }
+</style>
+</head>
+<body>
+
+<!-- The figure frames are created in code from the FIGURES table -->
+
+<div id="intro">
+  <button id="play" aria-label="Play">
+    <svg width="34" height="34" viewBox="0 0 34 34"><polygon points="11,7 27,17 11,27"/></svg>
+  </button>
+  <div id="intro-msg"></div>
+</div>
+
+<div id="controls">
+  <!-- Button order follows the direction each arrow points: the arrow
+       pointing left sits at the far left, the arrow pointing right at the far
+       right, and the rest in between. Left is "next". -->
+  <button id="nextBtn" aria-label="Next figure">
+    <svg width="28" height="28" viewBox="0 0 28 28">
+      <polygon points="14,6 14,22 6,14"/>
+      <polygon points="22,6 22,22 14,14"/>
+    </svg>
+  </button>
+  <button id="stopBtn" aria-label="Stop">
+    <svg width="28" height="28" viewBox="0 0 28 28"><rect x="8" y="8" width="12" height="12"/></svg>
+  </button>
+  <button id="pauseBtn" aria-label="Pause">
+    <svg width="28" height="28" viewBox="0 0 28 28">
+      <rect x="9" y="7" width="3.5" height="14"/>
+      <rect x="15.5" y="7" width="3.5" height="14"/>
+    </svg>
+  </button>
+  <button id="recBtn" aria-label="Record video">
+    <svg width="28" height="28" viewBox="0 0 28 28">
+      <circle id="recDot" cx="14" cy="14" r="6" fill="none" stroke="currentColor" stroke-width="2.5"/>
+    </svg>
+  </button>
+  <button id="backBtn" aria-label="Previous figure">
+    <svg width="28" height="28" viewBox="0 0 28 28">
+      <polygon points="6,6 6,22 14,14"/>
+      <polygon points="14,6 14,22 22,14"/>
+    </svg>
+  </button>
+</div>
+
+<div id="diag"></div>
+
+<!-- The video element must be at real size and merely transparent. With
+     display:none some browsers do not decode frames at all, so MediaPipe
+     receives no image, detects no body, and no figure draws -- a white screen
+     with no error. All five figures use opacity rather than display:none for
+     the same reason. -->
+<video id="video" playsinline muted
+       style="position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; opacity:0; pointer-events:none;"></video>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+
+<script>
+// The cycle page.
+//
+// The camera and the detection engine run here, in the host page, exactly
+// once. The five figures sit in preloaded frames, and every frame of pose data
+// is pushed into the active figure through the onResults function it exposes
+// -- precisely the same interface it has when opened on its own. That way each
+// figure stays its own original file: a fix in the figure file shows up here on
+// refresh, with nothing to keep in sync.
+
+// ------------------------------------------------------------------
+// The figure table. This is the only place to touch in order to add a figure,
+// remove one, change the order, or change how long each one is shown.
+// ------------------------------------------------------------------
+// slug: an ASCII name used for downloaded files. A non-ASCII filename is
+// silently rejected on download -- the click happens and nothing is saved.
+const FIGURES = [
+  { name: 'feathers', slug: 'feathers', src: 'figure1.html' },
+  { name: 'circles',  slug: 'circles',  src: 'figure2.html' },
+  { name: 'spirals',  slug: 'spirals',  src: 'figure3.html' },
+  { name: 'cones',    slug: 'cones',    src: 'figure4.html' },
+  { name: 'plates',   slug: 'plates',   src: 'figure5.html' }
+];
+
+const HOLD_MS = 20000;   // how long each figure stays on screen
+const WARMUP_MS = 500;   // how long to feed the incoming figure before revealing it
+
+// ------------------------------------------------------------------
+
+const intro = document.getElementById('intro');
+const introMsg = document.getElementById('intro-msg');
+const playBtn = document.getElementById('play');
+const video = document.getElementById('video');
+const controls = document.getElementById('controls');
+
+// Creating the frames. A timestamp is added to the URL so that an edit to a
+// figure file is reloaded instead of being served from cache -- otherwise you
+// edit, refresh, and see the old version.
+const stamp = Date.now();
+
+const frames = FIGURES.map((fig) => {
+  const el = document.createElement('iframe');
+  el.className = 'figure';
+  el.src = fig.src + '?v=' + stamp;
+  document.body.insertBefore(el, intro);
+  return el;
+});
+
+// A figure receives frames while it is the active one, and also during the
+// warm-up before it is revealed. Without the warm-up, a figure that has been
+// dormant for 80 seconds wakes with stale internal state (difference from the
+// previous frame, rest windows, rotation history) and jitters through its first
+// frames -- exactly when the eye is on it.
+let activeIndex = -1;
+let feeding = new Set();
+let holdTimer = null;
+let warmTimer = null;
+let running = false;
+let paused = false;   // pause: the current figure stays, the cycle stops
+
+// Diagnostic counters. Without these, every failure -- a camera that is not
+// feeding, frames that are blocked, a figure throwing an error -- looks exactly
+// the same: a white screen.
+const stats = { poseCallbacks: 0, framesWithBody: 0, deliveries: 0, lastError: null };
+
+function callInFrame(frame, fnName, arg) {
+  let w;
+  try { w = frame.contentWindow; } catch (e) {
+    stats.lastError = 'No access to the frame: ' + e.message;
+    return false;
+  }
+  if (!w) { stats.lastError = 'The frame did not load'; return false; }
+  if (typeof w[fnName] !== 'function') return false;
+  try { w[fnName](arg); return true; }
+  catch (e) { stats.lastError = 'Error inside the figure: ' + e.message; return false; }
+}
+
+const diag = document.getElementById('diag');
+function showDiag(title, lines) {
+  diag.innerHTML = '<b>' + title + '</b><br>' + lines.join('<br>');
+  diag.classList.add('show');
+}
+
+// Watchdog: if a few seconds have passed since the click and still nothing has
+// been drawn, explain why instead of leaving a white screen. It separates the
+// causes, because each one needs a different fix.
+function watchdog() {
+  if (stats.deliveries > 0) return;
+
+  if (location.protocol === 'file:') {
+    showDiag('This has to be served, not opened by double-clicking the file', [
+      'Browsers block access between files opened straight from a folder, so the figures receive no data.',
+      'In a terminal, inside the project folder: <code>python3 -m http.server 3456</code>',
+      'Then open: <code>http://localhost:3456/</code>'
+    ]);
+    return;
+  }
+  if (stats.poseCallbacks === 0) {
+    showDiag('The camera is not delivering an image', [
+      'The camera was allowed but no frames are arriving from it.',
+      'Check that no other application is holding the camera, then refresh.',
+      stats.lastError ? 'Last detail: ' + stats.lastError : ''
+    ].filter(Boolean));
+    return;
+  }
+  if (stats.framesWithBody === 0) {
+    showDiag('The camera works but no body is detected', [
+      'A large part of the body needs to be in frame, in reasonable light.',
+      'Stepping back from the camera helps, so the legs come into frame too.'
+    ]);
+    return;
+  }
+  showDiag('The body is detected but the figure is not drawing', [
+    stats.lastError ? 'Error: ' + stats.lastError : 'The figure did not receive the data.',
+    'This is a bug in the code -- worth reporting along with this text.'
+  ]);
+}
+
+function show(index) {
+  frames.forEach((f, i) => f.classList.toggle('active', i === index));
+  activeIndex = index;
+}
+
+// Moving to the next figure: reset it, start feeding it behind the scenes, and
+// only once it has settled swap what is on screen.
+function goTo(index) {
+  clearTimeout(holdTimer);
+  clearTimeout(warmTimer);
+
+  const incoming = frames[index];
+
+  // Force the incoming figure to re-measure its canvas. A figure that loaded or
+  // sat dormant while the window was a different size keeps a canvas at the old
+  // size -- and in the extreme case, a zero-width canvas that draws nothing.
+  try { incoming.contentWindow.dispatchEvent(new Event('resize')); } catch (e) {}
+
+  callInFrame(incoming, 'resetFigure');
+  feeding.add(index);
+
+  warmTimer = setTimeout(() => {
+    show(index);
+    feeding = new Set([index]);
+    // While paused no transition is scheduled: the figure stays on screen
+    // indefinitely. It keeps living and responding to movement -- what stops is
+    // only the cycle.
+    if (!paused) holdTimer = setTimeout(() => goTo((index + 1) % frames.length), HOLD_MS);
+  }, activeIndex === -1 ? 0 : WARMUP_MS);
+}
+
+// ------------------------------------------------------------------
+// Interpolation: decoupling the draw rate from the detection rate.
+//
+// MediaPipe supplies a pose roughly 15-20 times a second, against a screen that
+// refreshes 60 times. Drawing only when a new pose arrives makes every update a
+// step. It shows most in the cones, where the ring sits far from the shoulder:
+// a small angular step there becomes a jump of tens of pixels at the rim.
+//
+// So the latest pose is kept as a target, and on every screen frame the drawn
+// pose advances a fixed fraction of the distance toward it. The cost is a very
+// small delay.
+const FOLLOW = 0.34;           // fraction of the distance to the target closed each screen frame
+const SNAP_DIST = 0.18;        // a jump larger than this (a body appearing or
+                                // disappearing, detection jumping to another
+                                // person) is passed through immediately without
+                                // smoothing, otherwise the figure would "fly"
+                                // across the screen. In MediaPipe's normalized
+                                // units -- 18% of the frame width -- so it does
+                                // not depend on the window size
+let targetPose = null;         // the most recent pose received from detection
+let shownPose = null;          // the pose currently drawn, creeping toward the target
+
+function onPoseResults(results) {
+  if (!running) return;
+  stats.poseCallbacks++;
+  if (results.poseLandmarks) stats.framesWithBody++;
+  targetPose = results.poseLandmarks || null;
+  if (!targetPose) shownPose = null;
+}
+
+// Move the displayed pose toward the target. The jump is measured in
+// MediaPipe's normalized units, which is why the threshold is size-independent.
+function advancePose() {
+  if (!targetPose) return null;
+  if (!shownPose) {
+    shownPose = targetPose.map(p => ({ x: p.x, y: p.y, z: p.z, visibility: p.visibility }));
+    return shownPose;
+  }
+  for (let i = 0; i < targetPose.length; i++) {
+    const t = targetPose[i], s = shownPose[i];
+    if (!t || !s) continue;
+    const far = Math.hypot(t.x - s.x, t.y - s.y) > SNAP_DIST;
+    const k = far ? 1 : FOLLOW;
+    s.x += (t.x - s.x) * k;
+    s.y += (t.y - s.y) * k;
+    s.z += ((t.z || 0) - s.z) * k;
+    s.visibility = t.visibility;
+  }
+  return shownPose;
+}
+
+// The draw loop: runs at screen rate, not at detection rate
+(function renderLoop() {
+  requestAnimationFrame(renderLoop);
+  if (!running) return;
+  const pose = advancePose();
+  if (!pose) return;
+  const payload = { poseLandmarks: pose };
+  for (const i of feeding) {
+    if (callInFrame(frames[i], 'onResults', payload)) {
+      stats.deliveries++;
+      diag.classList.remove('show');   // recovered -- take the message down
+    }
+  }
+})();
+
+// ------------------------------------------------------------------
+// Starting up. The camera request sits on the button click rather than on page
+// load, because browsers require a user gesture to grant camera access.
+// ------------------------------------------------------------------
+// The engine is built exactly once. After stop you can press play again, which
+// simply resumes -- without creating a second camera and detection engine
+// running in parallel.
+let engineReady = false;
+
+// Fullscreen. The browser only allows this from within a user gesture, so it
+// sits on the play click -- just like the camera request. If the browser refuses
+// (for instance when embedded in a frame) we simply continue without fullscreen,
+// breaking nothing.
+function goFullscreen() {
+  const el = document.documentElement;
+  const req = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (req) { try { req.call(el); } catch (e) {} }
+}
+
+function beginShow() {
+  running = true;
+  goFullscreen();
+  intro.classList.add('gone');
+  controls.classList.add('show');
+  goTo(0);
+  setTimeout(watchdog, 4000);
+}
+
+async function start() {
+  if (engineReady) { beginShow(); return; }
+
+  playBtn.disabled = true;
+  introMsg.textContent = 'Requesting camera access...';
+
+  const pose = new Pose({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}` });
+  pose.setOptions({
+    modelComplexity: 1, smoothLandmarks: true, enableSegmentation: false,
+    minDetectionConfidence: 0.5, minTrackingConfidence: 0.5
+  });
+  pose.onResults(onPoseResults);
+
+  const camera = new Camera(video, {
+    onFrame: async () => { await pose.send({ image: video }); },
+    width: 1280, height: 720
+  });
+
+  try {
+    await camera.start();
+  } catch (err) {
+    playBtn.disabled = false;
+    introMsg.textContent = 'Could not access the camera: ' + err.message;
+    return;
+  }
+
+  engineReady = true;
+  beginShow();
+}
+
+playBtn.addEventListener('click', start);
+
+// Warn immediately on load rather than after a click: when the file is opened
+// directly from the folder (file://) the browser gives every file its own
+// origin and blocks access between the page and the frames, so the figures will
+// never receive data. Better to say so up front than to leave a button that
+// looks fine and does nothing.
+if (location.protocol === 'file:') {
+  playBtn.disabled = true;
+  showDiag('This has to be served, not opened by double-clicking the file', [
+    'Browsers block access between files opened straight from a folder, so the figures will receive no data.',
+    'In a terminal, inside the project folder: <code>python3 -m http.server 3456</code>',
+    'Then open: <code>http://localhost:3456/</code>'
+  ]);
+}
+
+// --- Controls: identical behaviour for the buttons and the keyboard ------
+function nextFigure() {
+  if (!running) return;
+  goTo((activeIndex + 1) % frames.length);
+}
+function prevFigure() {
+  if (!running) return;
+  goTo((activeIndex - 1 + frames.length) % frames.length);
+}
+// Pause: the cycle stops and the current figure stays on screen indefinitely.
+// It keeps responding to movement -- only the automatic transition is suspended.
+// The arrows keep working while paused, and pause survives a manual switch.
+function togglePause() {
+  if (!running) return;
+  paused = !paused;
+  pauseBtn.classList.toggle('on', paused);
+  if (paused) {
+    clearTimeout(holdTimer);
+  } else if (activeIndex >= 0) {
+    holdTimer = setTimeout(() => goTo((activeIndex + 1) % frames.length), HOLD_MS);
+  }
+}
+
+function stopShow() {
+  if (!running) return;
+  stopRecording();   // stopping also ends an active recording, and the file downloads
+  paused = false;
+  pauseBtn.classList.remove('on');
+  // leave fullscreen, back to the intro screen
+  if (document.fullscreenElement && document.exitFullscreen) {
+    try { document.exitFullscreen(); } catch (e) {}
+  }
+  clearTimeout(holdTimer); clearTimeout(warmTimer);
+  running = false;
+  feeding = new Set();
+  // Clear the interpolation state, otherwise on the next run the figure would
+  // creep out of the old pose
+  targetPose = null;
+  shownPose = null;
+  show(-1);
+  activeIndex = -1;
+  controls.classList.remove('show');
+  diag.classList.remove('show');
+  playBtn.disabled = false;
+  introMsg.textContent = '';
+  intro.classList.remove('gone');
+}
+
+const pauseBtn = document.getElementById('pauseBtn');
+document.getElementById('nextBtn').addEventListener('click', nextFigure);
+document.getElementById('backBtn').addEventListener('click', prevFigure);
+document.getElementById('stopBtn').addEventListener('click', stopShow);
+pauseBtn.addEventListener('click', togglePause);
+
+// --- Video recording ----------------------------------------------
+// Not a screen capture: this records the pixels of the canvas itself. A screen
+// capture takes the composited screen at display resolution and then shrinks it,
+// and thin black lines on white are exactly the content video compression is
+// worst at -- they smear and fall apart. Recording straight from the canvas
+// skips that stage entirely.
+//
+// On top of that, while recording the frames are enlarged to 1920x1080 and
+// scaled down visually. That way the figures draw at full resolution to begin
+// with instead of being stretched up to it, and that is most of the difference
+// in sharpness.
+const REC_W = 1920, REC_H = 1080, REC_FPS = 30;
+
+const recCanvas = document.createElement('canvas');
+recCanvas.width = REC_W; recCanvas.height = REC_H;
+const recCtx = recCanvas.getContext('2d');
+
+const recBtn = document.getElementById('recBtn');
+let recorder = null, recChunks = [], recRAF = null;
+
+function applyRecordingLayout(on) {
+  const s = Math.min(window.innerWidth / REC_W, window.innerHeight / REC_H);
+  const offX = (window.innerWidth - REC_W * s) / 2;
+  const offY = (window.innerHeight - REC_H * s) / 2;
+  for (const f of frames) {
+    if (on) {
+      f.style.width = REC_W + 'px';
+      f.style.height = REC_H + 'px';
+      f.style.transformOrigin = 'top left';
+      f.style.transform = `translate(${offX}px, ${offY}px) scale(${s})`;
+    } else {
+      f.style.width = ''; f.style.height = '';
+      f.style.transform = ''; f.style.transformOrigin = '';
+    }
+    try { f.contentWindow.dispatchEvent(new Event('resize')); } catch (e) {}
+  }
+}
+
+function activeCanvases() {
+  const f = frames[activeIndex];
+  if (!f) return [];
+  try { return Array.from(f.contentDocument.querySelectorAll('canvas')); }
+  catch (e) { return []; }
+}
+
+// The camera inset in the corner, mirrored so it matches the direction the
+// figures move in
+function drawCameraInset() {
+  if (!video.videoWidth) return;
+  const w = 384, h = Math.round(w * video.videoHeight / video.videoWidth);
+  const x = REC_W - w - 48, y = REC_H - h - 48;
+  recCtx.save();
+  recCtx.translate(x + w, y);
+  recCtx.scale(-1, 1);
+  recCtx.drawImage(video, 0, 0, w, h);
+  recCtx.restore();
+  recCtx.strokeStyle = '#000';
+  recCtx.lineWidth = 1.5;
+  recCtx.strokeRect(x, y, w, h);
+}
+
+function paintRecordingFrame() {
+  recRAF = requestAnimationFrame(paintRecordingFrame);
+  recCtx.fillStyle = '#fff';
+  recCtx.fillRect(0, 0, REC_W, REC_H);
+  // Some figures have several canvases (the circles have a trail layer and a
+  // live layer) -- draw them in order
+  for (const c of activeCanvases()) {
+    if (c.width && c.height) recCtx.drawImage(c, 0, 0, REC_W, REC_H);
+  }
+  drawCameraInset();
+}
+
+function pickMime() {
+  const options = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  for (const m of options) if (MediaRecorder.isTypeSupported(m)) return m;
+  return '';
+}
+
+function startRecording() {
+  if (recorder || !running) return;
+  applyRecordingLayout(true);
+  recChunks = [];
+  const stream = recCanvas.captureStream(REC_FPS);
+  const mimeType = pickMime();
+  recorder = new MediaRecorder(stream, mimeType
+    ? { mimeType, videoBitsPerSecond: 16000000 }
+    : { videoBitsPerSecond: 16000000 });
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(recChunks, { type: 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'movement-notation-' + Date.now() + '.webm';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  };
+  recorder.start();
+  paintRecordingFrame();
+  recBtn.classList.add('on');
+}
+
+function stopRecording() {
+  if (!recorder) return;
+  cancelAnimationFrame(recRAF);
+  recorder.stop();
+  recorder = null;
+  recBtn.classList.remove('on');
+  applyRecordingLayout(false);
+}
+
+recBtn.addEventListener('click', () => recorder ? stopRecording() : startRecording());
+
+// A single still of the active figure, at full resolution. Press S.
+function captureStill() {
+  if (!running || activeIndex < 0) return;
+
+  // Capture the canvas at the size it is right now, without touching the
+  // layout. Resizing a canvas *clears* its content, so enlarging the frame first
+  // would both blank the image and wipe the accumulated trail in the figures
+  // that build one up (circles, cones).
+  const cs = activeCanvases().filter(c => c.width && c.height);
+  if (!cs.length) return;
+
+  const out = document.createElement('canvas');
+  out.width = cs[0].width;
+  out.height = cs[0].height;
+  const octx = out.getContext('2d');
+  octx.fillStyle = '#fff';
+  octx.fillRect(0, 0, out.width, out.height);
+  for (const c of cs) octx.drawImage(c, 0, 0);
+
+  const a = document.createElement('a');
+  a.download = 'movement-notation-' + FIGURES[activeIndex].slug + '-' + Date.now() + '.png';
+  a.href = out.toDataURL('image/png');
+  a.click();
+}
+
+// The same actions from the keyboard
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight') nextFigure();
+  if (e.key === 'ArrowLeft') prevFigure();
+  if (e.key === 'Escape') stopShow();
+  if (e.key === 's' || e.key === 'S') captureStill();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Movement Notation: Figure 4 (cones)</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #fff; overflow: hidden; }
+    #container { position: relative; width: 100vw; height: 100vh; }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+<div id="container">
+  <canvas id="canvasTrail"></canvas>
+  <canvas id="canvasSkeleton"></canvas>
+</div>
+
+<!-- The shared skeleton, as in every other figure: same line weight and same
+     colour. -->
+<script src="skeleton.js"></script>
+
+<script>
+// Figure 4: cones.
+//
+// This file is loaded by index.html inside a frame. It has no camera and no
+// detection engine of its own: the host page runs both, once, and pushes the
+// body landmarks in through window.onResults.
+//
+// Two overlapping canvases in one place:
+//   canvasTrail    -- the cones only. Never fully cleared; covered by a
+//                      partly-transparent white layer each frame, so it leaves
+//                      a fading trace.
+//   canvasSkeleton -- the bone lines and the dots only. Fully cleared every
+//                      frame, always crisp, with no trail at all.
+// Inside the cone layer no separate mechanism is needed to make "the present
+// darker": it follows from the structure -- the current frame is drawn at full
+// opacity over a layer knocked back one more time by the fillRect.
+// Key T: switches live between normal mode and trail mode. Keys [ ]: tune the fade.
+//
+// One cone per limb, with its apex at the shoulder or hip and its far side a
+// real 3D circle around the outer joint. The circle is built from two vectors
+// perpendicular to the bone direction in 3D (using MediaPipe's z), and
+// projected orthographically onto the screen plane -- so it reads as a full
+// circle when the bone points at the camera, a straight line when it is
+// perpendicular to the camera, and an ellipse at every angle in between. The
+// distance from the apex to the centre of the circle is exactly the 3D length
+// of the bone, no more and no less.
+const canvas = document.getElementById('canvasTrail');
+const ctx = canvas.getContext('2d');                          // cones only
+const canvasSkel = document.getElementById('canvasSkeleton');
+const ctxSkel = canvasSkel.getContext('2d');                   // skeleton only -- always clean
+
+const BONE_WIDTH = MovementNotation.STYLE.boneWidth;   // from the shared skeleton
+const JOINT_RADIUS = MovementNotation.STYLE.jointRadius; // from the shared skeleton
+const MIN_RING_RADIUS = 10;     // floor, so the ring stays legible when the arm is at rest
+const MIN_RING_DIST = 26;       // minimum distance from the apex to the ring
+const RING_STEPS = 60;
+const RULE_COUNT = 90;         // the ruling lines that build the cone surface
+const RULE_WIDTH = 0.35;       // weight of the line from apex to circle -- thin,
+                                // so the surface reads as a mesh, not a solid mass
+const HIGHLIGHT_SPAN = 1.1;    // width of the highlight around the hand position (radians)
+const MIN_FLATTEN = 0.12;      // minimum thickness for the ellipse: even when the
+                                // bone is exactly perpendicular to the camera
+                                // (mathematically a completely flat line), a thin
+                                // ring is kept so the cone stays readable as a shape
+// The two ends of the cone are smoothed separately, at different rates. A lower
+// value means heavier smoothing.
+const APEX_SMOOTH = 0.16;       // the shoulder/hip -- relatively responsive
+const TIP_SMOOTH = 0.07;        // the hand/ankle -- the end that draws the
+                                 // circle, and the more smoothed of the two.
+                                 // The deliberate cost: the circle lags
+                                 // slightly behind the hand
+const HEAD_RING_MAX_RADIUS_FRAC = 0.055; // a ceiling for the head ring only
+
+// Measuring "how much is the user rotating right now" -- this is what drives
+// the growth, and therefore what encourages radial movement. It measures the
+// accumulated angle of the bone around the apex over a time window: real
+// rotation accumulates angle continuously, whereas a back-and-forth wobble
+// cancels itself out and accumulates nothing -- so only genuinely circular
+// movement is "rewarded".
+const SPIN_WINDOW_MS = 1600;   // measurement window for the accumulated angle
+const SPIN_FOR_MAX = Math.PI * 2.2;
+
+// --- rotation speed --------------------------------------------------
+// Angular velocity is measured over a short window and mapped through a curve
+// that keeps rising with no hard ceiling, so there is always more to gain from
+// accelerating.
+const SPEED_WINDOW_MS = 260;   // short window: measures speed now, not in the past
+const SPEED_SCALE = 7.0;       // radians per second at which about 63% of the intensity is reached
+const SPEED_RISE = 0.35;       // fast response to acceleration, so it is felt immediately
+const SPEED_FALL = 0.06;       // slow decay -- leaves a memory and encourages carrying on
+
+// The ring itself is an ordinary black line, exactly like every line in the
+// skeleton. Where the hand touches it the line itself *thickens* and turns pink
+// -- not a separate bead placed on top of it, but a swelling of the line.
+const TOUCH_SPAN = 0.55;       // radians -- width of the contact zone around the hand
+const RING_WIDTH = 1.5;        // line weight where the hand is not -- like a bone
+const TOUCH_WIDTH_MAX = 11;    // line weight at the point of contact
+const TOUCH_COLOR = [236, 72, 153];   // pink
+const RING_COLOR = [0, 0, 0];         // standard black
+
+// Detecting which segment of the limb is leading the movement right now
+const MOVE_WINDOW_MS = 400;
+const PROX_ENTER_PX = 18, PROX_EXIT_PX = 9;
+const DIST_ENTER_PX = 18, DIST_EXIT_PX = 9;
+
+function resize() {
+  canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+  canvasSkel.width = window.innerWidth; canvasSkel.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+const ID = {
+  leftEye: 2, rightEye: 5,
+  Lsh: 11, Rsh: 12, Lel: 13, Rel: 14, Lwr: 15, Rwr: 16,
+  Lhip: 23, Rhip: 24, Lkn: 25, Rkn: 26, Lank: 27, Rank: 28
+};
+
+const PLAIN_EDGES = [
+  { a: 'leftEye', b: 'rightEye' },
+  { a: 'leftEye', b: 'shouldersMid' },
+  { a: 'Lsh', b: 'Rsh' },
+  { a: 'shouldersMid', b: 'hipsMid' },
+  { a: 'Lhip', b: 'Rhip' }
+];
+
+const LIMBS = [
+  { key: 'Larm', prox: 'Lsh', mid: 'Lel', dist: 'Lwr' },
+  { key: 'Rarm', prox: 'Rsh', mid: 'Rel', dist: 'Rwr' },
+  { key: 'Lleg', prox: 'Lhip', mid: 'Lkn', dist: 'Lank' },
+  { key: 'Rleg', prox: 'Rhip', mid: 'Rkn', dist: 'Rank' }
+];
+
+function getLandmark(lm, index) {
+  const p = lm[index];
+  if (!p || p.visibility < 0.3) return null;
+  // z arrives from MediaPipe roughly normalized, "roughly the same scale as x"
+  // according to the documentation -- multiplying by the canvas width brings it
+  // to the same order of magnitude as x/y in pixels
+  return { x: (1 - p.x) * canvas.width, y: p.y * canvas.height, z: p.z * canvas.width };
+}
+function mid(a, b) {
+  return (a && b) ? { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, z: (a.z + b.z) / 2 } : null;
+}
+
+// MediaPipe shifts the joint positions slightly even when the body is still.
+// The cone uses a smoothed version of the end points, while the skeleton stays
+// responsive to the live ones.
+const conePoints = {};
+function smoothConePoints(key, A, B) {
+  let state = conePoints[key];
+  if (!state) {
+    state = conePoints[key] = {
+      A: { x: A.x, y: A.y, z: A.z },
+      B: { x: B.x, y: B.y, z: B.z }
+    };
+  }
+  // The two end points are treated differently on purpose. The reason is
+  // mathematical: a tremor at the apex moves the ring twice -- once by
+  // displacing it and again by rotating the axis around it -- while a tremor at
+  // the tip moves it once. The apex is the lever, so that is where the stability
+  // is needed. The cost is that movement originating at the shoulder is
+  // under-represented.
+  for (const name of ['A', 'B']) {
+    const source = name === 'A' ? A : B;
+    const target = state[name];
+    const k = name === 'A' ? APEX_SMOOTH : TIP_SMOOTH;
+    target.x += (source.x - target.x) * k;
+    target.y += (source.y - target.y) * k;
+    target.z += (source.z - target.z) * k;
+  }
+  return state;
+}
+
+// The skeleton -- lines and dots -- is always drawn on ctxSkel, which is fully
+// cleared every frame. Only the cones leave a trace.
+function strokeLine(A, B, lw) {
+  ctxSkel.strokeStyle = '#000';
+  ctxSkel.lineWidth = lw;
+  ctxSkel.setLineDash([]);
+  ctxSkel.beginPath();
+  ctxSkel.moveTo(A.x, A.y); ctxSkel.lineTo(B.x, B.y);
+  ctxSkel.stroke();
+}
+function dot(p, r) { ctxSkel.fillStyle = '#000'; ctxSkel.beginPath(); ctxSkel.arc(p.x, p.y, r, 0, Math.PI * 2); ctxSkel.fill(); }
+
+// --- 3D vector helpers ------------------------------------------------
+function sub(a, b) { return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }; }
+function length3(v) { return Math.hypot(v.x, v.y, v.z); }
+function normalize3(v) { const L = length3(v) || 1; return { x: v.x / L, y: v.y / L, z: v.z / L }; }
+function cross3(a, b) {
+  return { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x };
+}
+
+// Colours: neutral grey at rest, soft pink in motion
+const REST_COLOR = [176, 176, 176];
+const MOTION_COLOR = [244, 184, 200];
+function lerpColor(a, b, t) { return a.map((v, i) => Math.round(v + (b[i] - v) * t)); }
+
+// --- spin tracking: how much is this limb actually rotating right now? ---
+// This is the heart of the affordance. The change in the bone's angle (relative
+// to the apex) is accumulated over a time window. Real circular rotation
+// accumulates angle continuously in one direction; a back-and-forth wobble
+// cancels itself out. So only genuinely conical movement grows the cone.
+const spinHistory = {};
+const coneAxis = {};           // the cone axis (average bone direction), per limb
+const halfAngle = {};          // the cone's half-opening angle
+const intensityState = {};     // smoothed visual intensity
+const AXIS_SMOOTH = 0.05;      // how fast the axis updates -- low = stable axis
+const HALF_ANGLE_SMOOTH = 0.06;
+const MIN_HALF_ANGLE = 0.16;   // minimum opening so there is always a visible ring
+const MAX_HALF_ANGLE = Math.PI / 4;  // 45 degrees from the axis -- meaning the
+                                // angle at the apex never exceeds 90 degrees.
+                                // Beyond that the apex turns obtuse, the shape
+                                // stops reading as a cone and takes over the screen
+
+function spinAmount(key, A, B, now) {
+  const angle = Math.atan2(B.y - A.y, B.x - A.x);
+  let hist = spinHistory[key];
+  if (!hist) hist = spinHistory[key] = [];
+
+  if (hist.length) {
+    let d = angle - hist[hist.length - 1].angle;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    hist.push({ angle, delta: d, t: now });
+  } else {
+    hist.push({ angle, delta: 0, t: now });
+  }
+  while (hist.length && now - hist[0].t > SPIN_WINDOW_MS) hist.shift();
+
+  // The absolute total of the angle accumulated in the window -- the absolute
+  // value of the sum, so a symmetric wobble cancels out while consistent
+  // rotation accumulates
+  let signed = 0;
+  for (const h of hist) signed += h.delta;
+  return Math.abs(signed);
+}
+
+// Signed angular velocity, in radians per second, from a short window. The sign
+// matters: it determines which way the arc smears, that is, which direction the
+// hand is turning.
+const speedHistory = {};
+const speedState = {};
+
+function angularVelocity(key, A, B, now) {
+  const angle = Math.atan2(B.y - A.y, B.x - A.x);
+  let h = speedHistory[key];
+  if (!h) h = speedHistory[key] = [];
+
+  if (h.length) {
+    let d = angle - h[h.length - 1].angle;
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    h.push({ angle, delta: d, t: now });
+  } else {
+    h.push({ angle, delta: 0, t: now });
+  }
+  while (h.length > 1 && now - h[0].t > SPEED_WINDOW_MS) h.shift();
+
+  const span = (now - h[0].t) / 1000;
+  if (span < 0.02) return { omega: 0, norm: speedState[key] || 0 };
+
+  // Skip the first sample: its delta was measured against a sample that has
+  // already left the window, and counting it inflates the speed by about 14%
+  let signed = 0;
+  for (let i = 1; i < h.length; i++) signed += h[i].delta;
+  const omega = signed / span;                     // radians per second, signed
+
+  // A curve that keeps rising: there is no point at which further acceleration stops mattering
+  const target = 1 - Math.exp(-Math.abs(omega) / SPEED_SCALE);
+  if (speedState[key] === undefined) speedState[key] = 0;
+  const rate = target > speedState[key] ? SPEED_RISE : SPEED_FALL;
+  speedState[key] += (target - speedState[key]) * rate;
+
+  return { omega, norm: speedState[key] };
+}
+
+
+// The cone: apex A, and a real 3D circle around B (the hand or foot sits exactly
+// on its circumference, not at its centre -- the centre of the circle is pushed
+// forward past B, along the bone direction). The orientation of the ellipse and
+// how "open" it is (a full circle, a flat line, or something in between) follow
+// from the true angle of the bone relative to the camera (in 3D, using z). Two
+// straight lines are also drawn from the apex to the extreme points of the
+// circle, so the whole megaphone shape is visible.
+function drawLiveCone(key, A, B, now, options = {}) {
+  const v = sub(B, A);
+  // The cone's length is measured on screen, not in 3D. MediaPipe's z is
+  // multiplied by the canvas width, and when the arm points toward the camera it
+  // inflates the 3D length by tens of percent -- and then the cone is drawn
+  // longer than the arm you can see. Measured: in the same pose on screen, the
+  // cone reached 127% of the arm's length. The 3D direction still sets the tilt
+  // of the ellipse, but the length is derived from what is actually visible.
+  const L = Math.hypot(v.x, v.y);
+  if (L < 6) return;
+  const boneDir = normalize3(v);
+
+  // The cone axis = the average bone direction over time (in 3D). In conical
+  // movement the bone rotates around this axis, so it is the stable thing --
+  // not the instantaneous bone.
+  let axis;
+  if (options.axis) {
+    // For the head a fixed upward axis is kept, rather than one affected by camera depth.
+    axis = normalize3(options.axis);
+  } else {
+    if (!coneAxis[key]) coneAxis[key] = { x: boneDir.x, y: boneDir.y, z: boneDir.z };
+    const axRaw = coneAxis[key];
+    axRaw.x += (boneDir.x - axRaw.x) * AXIS_SMOOTH;
+    axRaw.y += (boneDir.y - axRaw.y) * AXIS_SMOOTH;
+    axRaw.z += (boneDir.z - axRaw.z) * AXIS_SMOOTH;
+    axis = normalize3(axRaw);
+  }
+
+  // The ring is built so that the end of the limb -- the hand or the ankle --
+  // always sits on it, exactly. The vector from apex to tip is decomposed into
+  // two components relative to the axis: the component along the axis sets how
+  // far out the ring sits, and the perpendicular component is the ring's radius.
+  // It follows that the tip lies on the circumference, so the cone stays attached
+  // to the limb in every state -- straight, bent, at any angle.
+  const T = options.liveTip || B;
+  const dT = sub(T, A);
+
+  // Limiting the cone's opening. The width is set by the angle between the axis
+  // and the limb, and when the axis lags far behind -- which happens mainly at
+  // certain angles to the camera -- that angle grows and the cone opens up until
+  // it takes over the screen.
+  // The radius itself is not capped, because then the tip would detach from the
+  // circumference. Instead the axis itself is tilted toward the limb until the
+  // deviation drops to the ceiling. That way the opening is bounded and the tip
+  // still sits exactly on the circumference.
+  const dHat = normalize3(dT);
+  let cosDev = dHat.x * axis.x + dHat.y * axis.y + dHat.z * axis.z;
+  cosDev = Math.max(-1, Math.min(1, cosDev));
+  const dev = Math.acos(cosDev);
+  if (dev > MAX_HALF_ANGLE && dev > 1e-4) {
+    const f = (dev - MAX_HALF_ANGLE) / dev;          // how far to tilt toward the limb
+    const s = Math.sin(dev);
+    const w1 = Math.sin((1 - f) * dev) / s;
+    const w2 = Math.sin(f * dev) / s;
+    axis = normalize3({
+      x: axis.x * w1 + dHat.x * w2,
+      y: axis.y * w1 + dHat.y * w2,
+      z: axis.z * w1 + dHat.z * w2
+    });
+    // Write the corrected axis back, so it does not keep drifting on later frames
+    if (coneAxis[key]) { coneAxis[key].x = axis.x; coneAxis[key].y = axis.y; coneAxis[key].z = axis.z; }
+  }
+
+  // Two consequences of that construction: the tip always sits on the
+  // circumference, and the wider the circle the hand describes, the larger the
+  // ring grows. That is what turns widening circular movement into a reward.
+  let ringDist = dT.x * axis.x + dT.y * axis.y + dT.z * axis.z;
+  const radialVec = {
+    x: dT.x - axis.x * ringDist,
+    y: dT.y - axis.y * ringDist,
+    z: dT.z - axis.z * ringDist
+  };
+  let ringR = length3(radialVec);
+
+  // Ceiling on the angle at the apex. After the axis tilt the angle is already
+  // bounded, but with the limb folded very tightly ringDist is small and an
+  // obtuse angle is still reachable -- so it is capped directly here: the radius
+  // is never larger than tan(45 degrees) times the distance.
+  if (ringDist < MIN_RING_DIST) ringDist = MIN_RING_DIST;
+  const maxR = ringDist * Math.tan(MAX_HALF_ANGLE);
+  if (ringR > maxR) ringR = maxR;
+  if (ringR < MIN_RING_RADIUS) ringR = MIN_RING_RADIUS;
+  if (options.maxRingRadius) ringR = Math.min(ringR, options.maxRingRadius);
+
+  // Two vectors perpendicular to the axis, for building the circle in 3D
+  let ref = { x: 0, y: 0, z: 1 };
+  const c0 = cross3(axis, ref);
+  if (Math.abs(c0.x) + Math.abs(c0.y) + Math.abs(c0.z) < 1e-3) ref = { x: 1, y: 0, z: 0 };
+  const e1 = normalize3(cross3(axis, ref));
+  const e2 = normalize3(cross3(axis, e1));
+
+  const cx = A.x + axis.x * ringDist, cy = A.y + axis.y * ringDist;
+  const cz = A.z + axis.z * ringDist;
+
+  function ringPoint(theta) {
+    return {
+      x: cx + ringR * (Math.cos(theta) * e1.x + Math.sin(theta) * e2.x),
+      y: cy + ringR * (Math.cos(theta) * e1.y + Math.sin(theta) * e2.y),
+      z: cz + ringR * (Math.cos(theta) * e1.z + Math.sin(theta) * e2.z)
+    };
+  }
+
+  // ring: a high point count -- each point is one ruling line, and that is what builds the volume
+  const ring3 = [];
+  for (let i = 0; i < RULE_COUNT; i++) {
+    ring3.push(ringPoint((i / RULE_COUNT) * Math.PI * 2));
+  }
+  // A sparser version for the outline itself
+  const ring = [];
+  for (let i = 0; i < RING_STEPS * 2; i++) {
+    ring.push(ringPoint((i / (RING_STEPS * 2)) * Math.PI * 2));
+  }
+
+  // Visual intensity from the rotation speed right now. The speed is measured on
+  // the *live* hand, because the smoothed point blunts what is being measured.
+  const vel = angularVelocity(key, A, options.liveTip || B, now);
+  const intensity = vel.norm;
+  intensityState[key] = intensity;
+
+  // The cone surface: ruling lines from the apex out along the whole
+  // circumference. The varying density of those lines in projection is what
+  // reads as curved volume -- not a gradient on a flat shape.
+  const rimZ = ring3.map((p) => p.z);
+  const zMin = Math.min(...rimZ), zMax = Math.max(...rimZ);
+  const zSpan = (zMax - zMin) || 1;
+  // Draw from far to near, so the near lines cover the far ones
+  const ordered = ring3.map((p, i) => ({ p, i })).sort((a, b) => b.p.z - a.p.z);
+  for (const { p } of ordered) {
+    const depth = (p.z - zMin) / zSpan;       // 0 = near, 1 = far
+    // The surface is constant -- neutral grey, independent of movement. The bead
+    // alone carries the feedback, so the eye knows where to look.
+    const base = REST_COLOR;
+    // Depth: the wall nearest the camera is dark and opaque, the far one light
+    // and transparent. That is what gives the cone an inside and an outside --
+    // when the user stands in half profile and turns their arm, the near side
+    // reads as a close wall and the other as a far wall behind it.
+    const shade = 0.20 + 0.70 * depth;         // far = light, near = dark
+    const alpha = 0.62 - 0.34 * depth;         // far = more transparent
+    ctx.strokeStyle = `rgba(${(base[0] * shade) | 0},${(base[1] * shade) | 0},${(base[2] * shade) | 0},${alpha.toFixed(3)})`;
+    ctx.lineWidth = RULE_WIDTH;
+    ctx.beginPath();
+    ctx.moveTo(A.x, A.y);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+  }
+
+  // The ring with a travelling highlight: the hand is like a bead threaded on
+  // the line. Find the angle at which the hand sits on the ring, and emphasise
+  // the segment there -- thick and dark at the hand, fading gradually around the
+  // circumference.
+  // The highlight follows the *live* hand position, not the smoothed version: the
+  // ring is meant to stay put, but the bead represents where the hand is right
+  // now, so it has to be immediate.
+  const tip = options.liveTip || B;
+  const relB = { x: tip.x - cx, y: tip.y - cy, z: tip.z - cz };
+  const compE1 = relB.x * e1.x + relB.y * e1.y + relB.z * e1.z;
+  const compE2 = relB.x * e2.x + relB.y * e2.y + relB.z * e2.z;
+  const handTheta = Math.atan2(compE2, compE1);
+
+  ctx.setLineDash([]);
+  // The swelling fades gradually to both sides, so it reads like a bulge
+  // travelling along the thread as the hand runs around the circle.
+  const segs = RING_STEPS * 2;
+  for (let i = 0; i < segs; i++) {
+    const t0 = (i / segs) * Math.PI * 2;
+    const t1 = ((i + 1) / segs) * Math.PI * 2;
+    const tm = (t0 + t1) / 2;
+
+    // Angular distance from the hand, symmetric in both directions
+    let dth = Math.abs(tm - handTheta);
+    while (dth > Math.PI) dth = Math.abs(dth - 2 * Math.PI);
+    const w = dth < TOUCH_SPAN ? Math.pow(1 - dth / TOUCH_SPAN, 1.6) : 0;
+
+    const p0 = ringPoint(t0), p1 = ringPoint(t1);
+    const col = lerpColor(RING_COLOR, TOUCH_COLOR, w);
+    ctx.strokeStyle = `rgb(${col[0]},${col[1]},${col[2]})`;
+    ctx.lineWidth = RING_WIDTH + TOUCH_WIDTH_MAX * w;
+    ctx.beginPath();
+    ctx.moveTo(p0.x, p0.y);
+    ctx.lineTo(p1.x, p1.y);
+    ctx.stroke();
+  }
+}
+
+// The cone canvas is never fully cleared. Each frame it is covered by a white
+// layer at this alpha, so what was drawn before fades out gradually instead of
+// disappearing: a low value leaves a long trace, a high one a short trace.
+const TRAIL_FADE = 0.09;
+
+window.onResults = function (results) {
+  // The trail applies to the cone canvas alone. The skeleton is always on a
+  // clean canvas -- its present is crisp every frame regardless of trail mode.
+  ctx.fillStyle = `rgba(255,255,255,${TRAIL_FADE})`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctxSkel.clearRect(0, 0, canvasSkel.width, canvasSkel.height);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctxSkel.lineCap = 'round';
+  ctxSkel.lineJoin = 'round';
+  if (!results.poseLandmarks) return;
+  const lm = results.poseLandmarks;
+
+  const P = {};
+  for (const k in ID) P[k] = getLandmark(lm, ID[k]);
+  P.shouldersMid = mid(P.Lsh, P.Rsh);
+  P.hipsMid = mid(P.Lhip, P.Rhip);
+  P.headMid = mid(P.leftEye, P.rightEye);
+
+  const now = performance.now();
+  const joints = new Set();
+
+  for (const e of PLAIN_EDGES) {
+    const A = P[e.a], B = P[e.b];
+    if (!A || !B) continue;
+    joints.add(e.a); joints.add(e.b);
+    strokeLine(A, B, BONE_WIDTH);
+  }
+
+  // The head cone: its apex is locked to the centre of the neck -- the midpoint
+  // between the shoulders -- and its ring is tied to the eyes alone. It receives
+  // the live points and does not go through the shared smoothing, which would
+  // drag it along behind the shoulders and make it look as though it moved with
+  // the arms.
+  if (P.shouldersMid && P.headMid) {
+    drawLiveCone('head', P.shouldersMid, P.headMid, now, {
+      axis: { x: 0, y: -1, z: 0 },
+      maxRingRadius: canvas.height * HEAD_RING_MAX_RADIUS_FRAC,
+      liveTip: P.headMid
+    });
+  }
+
+  // The cones are drawn before the bone lines, so the bones stay clear above them
+  const activeCones = [];
+  for (const limb of LIMBS) {
+    const prox = P[limb.prox], midJ = P[limb.mid], dist = P[limb.dist];
+    // The cone always spans the whole limb: shoulder to hand, or hip to ankle.
+    // The elbow and knee are kept only for drawing the skeleton lines, and have
+    // no effect on the cone.
+    if (!prox || !dist) continue;
+    // The tip feeding the geometry is the *smoothed* point, not the live one --
+    // otherwise the circle is built straight from the raw detection and every
+    // step of it comes through in full.
+    const cone = smoothConePoints(limb.key, prox, dist);
+    drawLiveCone(limb.key, cone.A, cone.B, now);
+    if (midJ) {
+      joints.add(limb.prox); joints.add(limb.mid); joints.add(limb.dist);
+      activeCones.push({ prox, midJ, dist });
+    }
+  }
+
+  for (const c of activeCones) {
+    strokeLine(c.prox, c.midJ, BONE_WIDTH);
+    strokeLine(c.midJ, c.dist, BONE_WIDTH);
+  }
+
+  for (const j of joints) if (P[j]) dot(P[j], JOINT_RADIUS);
+};
+
+// The cone canvas keeps a fading trace, and the smoothing keeps state of its
+// own: the smoothed apex and tip of every cone, the axis each one is turning
+// around, and the rolling windows that measure rotation speed. All of it is
+// cleared here, so the figure starts from a blank canvas and a still body each
+// time it comes up rather than resuming from where it left off.
+window.resetFigure = function () {
+  for (const store of [conePoints, coneAxis, halfAngle, intensityState, spinHistory, speedHistory, speedState]) {
+    for (const k of Object.keys(store)) delete store[k];
+  }
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctxSkel.clearRect(0, 0, canvasSkel.width, canvasSkel.height);
+};
+</script>
+</body>
+</html>

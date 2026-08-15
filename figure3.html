@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Movement Notation: Figure 3 (spirals)</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #fff; overflow: hidden; }
+    #container { position: relative; width: 100vw; height: 100vh; }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+<div id="container">
+  <canvas id="canvas"></canvas>
+</div>
+
+<script src="skeleton.js"></script>
+
+<script>
+// Figure 3: spirals.
+//
+// Rotation around a limb's own axis. Graphic language from the Eshkol-Wachman
+// reference pages: full stick skeleton, and every bone carries a dense,
+// centered "compressed spring" (a 3D helix) wound around its mid-section. The
+// spring spins around the bone in the direction the bone travels along its own
+// axis, and the arrowhead sits on whichever end is leading that travel.
+// Everything is black.
+//
+// This file is loaded by index.html inside a frame. It has no camera and no
+// detection engine of its own: the host page runs both, once, and pushes the
+// body landmarks in through window.onResults.
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+const LOOPS = 6;              // the spring winds (dense / compressed)
+const SHORT_LOOPS = LOOPS - 1;// shoulders + pelvis carry one loop fewer
+                              // (the head uses LOOPS like every other bone)
+const STEPS_PER_LOOP = 40;    // sampling density per loop, keeps the curve smooth
+const SPRING_FRACTION = 0.5;  // portion of the bone a full-length spring occupies (centered)
+const MOVE_THRESHOLD = 0.02;  // rad/frame of rotation to count as "moving"
+const SPIN_GAIN = 0.05;       // how fast travel along the bone spins the spring
+const DIR_DEADZONE = 0.6;     // px/frame along the bone before the arrow switches ends
+const BONE_WIDTH = MovementNotation.STYLE.boneWidth;   // from the shared skeleton
+const JOINT_RADIUS = MovementNotation.STYLE.jointRadius;
+
+function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+const ID = {
+  leftEye: 2, rightEye: 5,
+  Lsh: 11, Rsh: 12, Lel: 13, Rel: 14, Lwr: 15, Rwr: 16,
+  Lhip: 23, Rhip: 24, Lkn: 25, Rkn: 26, Lank: 27, Rank: 28
+};
+
+// head edges are plain lines (no spring); all other bones carry a spring
+const EDGES = [
+  { a: 'leftEye', b: 'rightEye', head: true },        // line between the eyes
+  { a: 'leftEye', b: 'shouldersMid', head: true },    // left eye to base of neck
+  { a: 'Lsh', b: 'Rsh', loops: SHORT_LOOPS },          // shoulders
+  { a: 'shouldersMid', b: 'hipsMid' },                 // spine
+  { a: 'Lhip', b: 'Rhip', loops: SHORT_LOOPS },        // pelvis
+  { a: 'Lsh', b: 'Lel' }, { a: 'Lel', b: 'Lwr' },     // left arm
+  { a: 'Rsh', b: 'Rel' }, { a: 'Rel', b: 'Rwr' },     // right arm
+  { a: 'Lhip', b: 'Lkn' }, { a: 'Lkn', b: 'Lank' },   // left leg
+  { a: 'Rhip', b: 'Rkn' }, { a: 'Rkn', b: 'Rank' }    // right leg
+];
+
+const prevAngle = {};
+const prevMid = {};
+const phase = {};
+const leadEnd = {};   // +1 = arrow at B, -1 = arrow at A; held through the deadzone
+
+function getLandmark(lm, index) {
+  const p = lm[index];
+  if (!p || p.visibility < 0.3) return null;
+  return { x: (1 - p.x) * canvas.width, y: p.y * canvas.height };
+}
+function mid(a, b) { return (a && b) ? { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } : null; }
+function normAngle(d) { while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// Sample the dense compressed spring centered on the bone A->B into a point
+// list. Elliptical loops come from offsetting both perpendicular (sin) and
+// along-bone (cos). Sampled per-loop so the curve stays smooth, not faceted.
+function helixPoints(A, B, ph, loops, springLen, amp) {
+  const dx = B.x - A.x, dy = B.y - A.y, L = Math.hypot(dx, dy);
+  if (L < 6) return null;
+  const ux = dx / L, uy = dy / L;     // along the axis
+  const nx = -uy, ny = ux;            // perpendicular
+  const start = (L - springLen) / 2;  // centered on the axis
+  const axialAmp = amp * 0.55;            // along-axis radius -> loops read as ellipses
+  const steps = loops * STEPS_PER_LOOP;
+  const pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const along = start + t * springLen;
+    const phi = 2 * Math.PI * loops * t + ph;
+    pts.push({
+      x: A.x + ux * along + nx * (amp * Math.sin(phi)) + ux * (axialAmp * Math.cos(phi)),
+      y: A.y + uy * along + ny * (amp * Math.sin(phi)) + uy * (axialAmp * Math.cos(phi))
+    });
+  }
+  return pts;
+}
+
+function springPoints(A, B, ph, loops) {
+  const L = Math.hypot(B.x - A.x, B.y - A.y);
+  if (L < 6) return null;
+  // fewer loops -> a proportionally shorter spring, so the winding pitch
+  // stays identical to every other bone's
+  return helixPoints(A, B, ph, loops, L * SPRING_FRACTION * (loops / LOOPS), clamp(L * 0.12, 7, 26));
+}
+
+// The head's coil: wound around the head's own axis (neck base -> between the
+// eyes, extended past the crown) rather than around a bone, and scaled by the
+// eye separation so it hugs the head at any distance from the camera.
+function headAxis(P) {
+  const eyeMid = mid(P.leftEye, P.rightEye);
+  if (!eyeMid || !P.shouldersMid) return null;
+  const eyeDist = Math.hypot(P.rightEye.x - P.leftEye.x, P.rightEye.y - P.leftEye.y);
+  if (eyeDist < 2) return null;
+  let ax = eyeMid.x - P.shouldersMid.x, ay = eyeMid.y - P.shouldersMid.y;
+  const aL = Math.hypot(ax, ay);
+  if (aL < 1) return null;
+  ax /= aL; ay /= aL;
+  // The spring is bounded by two existing lines: it stops short of where the
+  // shoulder line meets the neck line, and ends exactly at the eye line. It
+  // touches neither of them.
+  const A = { x: P.shouldersMid.x + ax * eyeDist * 0.5, y: P.shouldersMid.y + ay * eyeDist * 0.5 };
+  const B = { x: eyeMid.x, y: eyeMid.y };
+  return {
+    A, B,
+    mid: { x: (A.x + B.x) / 2, y: (A.y + B.y) / 2 },
+    ux: ax, uy: ay
+  };
+}
+
+function strokePolyline(pts, lw) {
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = lw;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.stroke();
+}
+
+// Arrowhead on the end of the spring that leads the bone's travel:
+// dir = +1 -> the B end (last sample), dir = -1 -> the A end (first sample).
+function arrowHead(pts, dir) {
+  const n = pts.length;
+  const tip = dir > 0 ? pts[n - 1] : pts[0];
+  const prev = dir > 0 ? pts[n - 2] : pts[1];
+  const a = Math.atan2(tip.y - prev.y, tip.x - prev.x), s = 9;
+  ctx.beginPath();
+  ctx.moveTo(tip.x, tip.y); ctx.lineTo(tip.x - s * Math.cos(a - 0.5), tip.y - s * Math.sin(a - 0.5));
+  ctx.moveTo(tip.x, tip.y); ctx.lineTo(tip.x - s * Math.cos(a + 0.5), tip.y - s * Math.sin(a + 0.5));
+  ctx.stroke();
+}
+
+function dot(p, r) { ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill(); }
+
+window.onResults = function (results) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  if (!results.poseLandmarks) return;
+  const lm = results.poseLandmarks;
+
+  const P = {};
+  for (const k in ID) P[k] = getLandmark(lm, ID[k]);
+  P.shouldersMid = mid(P.Lsh, P.Rsh);
+  P.hipsMid = mid(P.Lhip, P.Rhip);
+
+  const joints = new Set();
+
+  for (let i = 0; i < EDGES.length; i++) {
+    const e = EDGES[i];
+    const A = P[e.a], B = P[e.b];
+    if (!A || !B) continue;
+    joints.add(e.a); joints.add(e.b);
+
+    if (e.head) {
+      ctx.strokeStyle = MovementNotation.STYLE.color; ctx.lineWidth = BONE_WIDTH; ctx.setLineDash([]);
+      ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+      continue;
+    }
+
+    const dx = B.x - A.x, dy = B.y - A.y, L = Math.hypot(dx, dy);
+    const theta = Math.atan2(dy, dx);
+    if (prevAngle[i] === undefined) prevAngle[i] = theta;
+    const da = normAngle(theta - prevAngle[i]);
+    prevAngle[i] = theta;
+
+    // how far the bone travelled along its own axis this frame; this is what
+    // both spins the spring and decides which end the arrow sits on
+    const mx = (A.x + B.x) / 2, my = (A.y + B.y) / 2;
+    if (prevMid[i] === undefined) prevMid[i] = { x: mx, y: my };
+    const ux = L > 0 ? dx / L : 0, uy = L > 0 ? dy / L : 0;
+    const vAlong = (mx - prevMid[i].x) * ux + (my - prevMid[i].y) * uy;
+    prevMid[i] = { x: mx, y: my };
+
+    // the spring spins around the bone in the direction of that travel
+    phase[i] = (phase[i] || 0) + vAlong * SPIN_GAIN;
+
+    // the leading end only flips once the travel clears the deadzone, so the
+    // arrow doesn't flicker when the bone is nearly still or moving sideways
+    if (leadEnd[i] === undefined) leadEnd[i] = 1;
+    if (Math.abs(vAlong) > DIR_DEADZONE) leadEnd[i] = vAlong > 0 ? 1 : -1;
+
+    const moving = Math.abs(da) > MOVE_THRESHOLD || Math.abs(vAlong) > 1.5;
+
+    // solid bone line under the spring
+    ctx.strokeStyle = MovementNotation.STYLE.color; ctx.lineWidth = BONE_WIDTH; ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+
+    const pts = springPoints(A, B, phase[i], e.loops || LOOPS);
+    if (pts) {
+      strokePolyline(pts, moving ? 2.5 : 1.5);
+      arrowHead(pts, leadEnd[i]);
+    }
+  }
+
+  // the head's own coil, spun and pointed by the same travel rule as the bones
+  const H = headAxis(P);
+  if (H) {
+    if (prevMid.head === undefined) prevMid.head = { x: H.mid.x, y: H.mid.y };
+    const vAlong = (H.mid.x - prevMid.head.x) * H.ux + (H.mid.y - prevMid.head.y) * H.uy;
+    prevMid.head = { x: H.mid.x, y: H.mid.y };
+
+    phase.head = (phase.head || 0) + vAlong * SPIN_GAIN;
+    if (leadEnd.head === undefined) leadEnd.head = 1;
+    if (Math.abs(vAlong) > DIR_DEADZONE) leadEnd.head = vAlong > 0 ? 1 : -1;
+
+    // The head gets exactly the same spring as every other bone -- same
+    // function, same number of turns, same pitch-to-length ratio and same
+    // amplitude rule. It is shorter than the limbs, but its density relative to
+    // its length is identical.
+    const pts = springPoints(H.A, H.B, phase.head, LOOPS);
+    if (pts) {
+      strokePolyline(pts, Math.abs(vAlong) > 1.5 ? 2.5 : 1.5);
+      arrowHead(pts, leadEnd.head);
+    }
+  }
+
+  ctx.fillStyle = '#000';
+  for (const j of joints) if (P[j]) dot(P[j], JOINT_RADIUS);
+};
+
+// Nothing accumulates on this canvas: it is cleared and redrawn every frame.
+// What does carry over between frames is the motion state, the spin phase of
+// each spring and the direction its arrow points. Clearing it here means the
+// figure starts still each time it comes up, instead of resuming mid-spin.
+window.resetFigure = function () {
+  for (const k of Object.keys(prevAngle)) delete prevAngle[k];
+  for (const k of Object.keys(prevMid)) delete prevMid[k];
+  for (const k of Object.keys(phase)) delete phase[k];
+  for (const k of Object.keys(leadEnd)) delete leadEnd[k];
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+};
+</script>
+</body>
+</html>
