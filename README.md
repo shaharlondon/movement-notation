@@ -75,33 +75,33 @@ weight, same joint points. Only the space built around it changes. That
 is what makes them five views of one thing rather than five separate
 projects.
 
-![Figure 1, feathers](images/figure1-feathers.png)
+![Figure 1, feathers](figure1-feathers.png)
 
 *Feathers. Every limb leaves a fan of petals behind it, one sampled every
 150 milliseconds, fading out over four and a half seconds. Sweeping up and
 down builds the fan; holding still lets it empty.*
 
-![Figure 2, circles](images/figure2-circles.png)
+![Figure 2, circles](figure2-circles.png)
 
 *Circles. A faint circle follows each limb segment, its radius the reach of
 that segment. Every time a joint angle crosses 90 or 180 degrees a coloured
 circle is stamped onto the canvas and stays there, so twenty seconds of
 movement accumulates into a field.*
 
-![Figure 3, spirals](images/figure3-spirals.png)
+![Figure 3, spirals](figure3-spirals.png)
 
 *Spirals. A compressed helix is wound around the middle of every bone. It
 spins in the direction the bone travels along its own axis, and the
 arrowhead sits on whichever end is leading.*
 
-![Figure 4, cones](images/figure4-cones.png)
+![Figure 4, cones](figure4-cones.png)
 
 *Cones. One cone per limb, its apex at the shoulder or hip and its rim a
 real circle in space around the hand or foot. The wider the circle the hand
 describes, the wider the cone opens. The pink swelling on the rim marks
 where the hand is at this moment.*
 
-![Figure 5, plates](images/figure5-plates.png)
+![Figure 5, plates](figure5-plates.png)
 
 *Plates. Every joint carries a plate lying parallel to the floor. The
 pelvis plate is the horizon line: plates near it are seen edge on, and the
